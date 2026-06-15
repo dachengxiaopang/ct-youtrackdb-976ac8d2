@@ -1,0 +1,96 @@
+package com.jetbrains.youtrackdb.internal.core.sql.executor;
+
+import com.jetbrains.youtrackdb.internal.common.concur.TimeoutException;
+import com.jetbrains.youtrackdb.internal.core.command.CommandContext;
+import com.jetbrains.youtrackdb.internal.core.db.DatabaseSessionEmbedded;
+import com.jetbrains.youtrackdb.internal.core.exception.BaseException;
+import com.jetbrains.youtrackdb.internal.core.exception.CommandExecutionException;
+import com.jetbrains.youtrackdb.internal.core.id.RecordIdInternal;
+import com.jetbrains.youtrackdb.internal.core.query.ExecutionStep;
+import com.jetbrains.youtrackdb.internal.core.query.Result;
+import com.jetbrains.youtrackdb.internal.core.sql.executor.resultset.ExecutionStream;
+import java.util.Collection;
+import java.util.List;
+import java.util.stream.Collectors;
+
+/**
+ * Source step that fetches records by a pre-computed list of Record IDs (RIDs).
+ *
+ * <p>Used when the FROM clause specifies explicit RIDs:
+ * <pre>
+ *  SELECT FROM [#10:3, #10:7, #22:1]
+ * </pre>
+ * or when the planner resolves input parameters / metadata targets to specific RIDs.
+ *
+ * <p>Each RID is loaded from the storage engine via the standard record iterator.
+ *
+ * @see SelectExecutionPlanner#handleRidsAsTarget
+ */
+public class FetchFromRidsStep extends AbstractExecutionStep {
+
+  /** The collection of RIDs to fetch; iterated lazily during execution. */
+  private Collection<RecordIdInternal> rids;
+
+  public FetchFromRidsStep(
+      Collection<RecordIdInternal> rids, CommandContext ctx, boolean profilingEnabled) {
+    super(ctx, profilingEnabled);
+    this.rids = rids;
+  }
+
+  @Override
+  public ExecutionStream internalStart(CommandContext ctx) throws TimeoutException {
+    // Drain predecessor for side effects before fetching by RID.
+    if (prev != null) {
+      prev.start(ctx).close(ctx);
+    }
+    return ExecutionStream.loadIterator(this.rids.iterator());
+  }
+
+  @Override
+  public String prettyPrint(int depth, int indent) {
+    return ExecutionStepInternal.getIndent(depth, indent)
+        + "+ FETCH FROM RIDs\n"
+        + ExecutionStepInternal.getIndent(depth, indent)
+        + "  "
+        + rids;
+  }
+
+  @Override
+  public Result serialize(DatabaseSessionEmbedded session) {
+    var result = ExecutionStepInternal.basicSerialize(session, this);
+    if (rids != null) {
+      result.setProperty(
+          "rids", rids.stream().map(RecordIdInternal::toString).collect(Collectors.toList()));
+    }
+    return result;
+  }
+
+  @Override
+  public void deserialize(Result fromResult, DatabaseSessionEmbedded session) {
+    try {
+      ExecutionStepInternal.basicDeserialize(fromResult, this, session);
+      if (fromResult.getProperty("rids") != null) {
+        List<String> ser = fromResult.getProperty("rids");
+        rids = ser.stream().map(rid -> RecordIdInternal.fromString(rid, false))
+            .collect(Collectors.toList());
+      }
+      reset();
+    } catch (Exception e) {
+      throw BaseException.wrapException(new CommandExecutionException(session, ""), e, session);
+    }
+  }
+
+  /**
+   * Not cacheable: the RID list is typically resolved from runtime parameters or
+   * literal values in the SQL statement, which may differ between executions.
+   */
+  @Override
+  public boolean canBeCached() {
+    return false;
+  }
+
+  @Override
+  public ExecutionStep copy(CommandContext ctx) {
+    return new FetchFromRidsStep(rids, ctx, profilingEnabled);
+  }
+}

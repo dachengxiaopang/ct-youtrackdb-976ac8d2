@@ -1,0 +1,116 @@
+package com.jetbrains.youtrackdb.internal.core.gremlin;
+
+import com.jetbrains.youtrackdb.api.gremlin.embedded.YTDBElement;
+import com.jetbrains.youtrackdb.api.gremlin.embedded.YTDBProperty;
+import com.jetbrains.youtrackdb.internal.core.db.record.record.Entity;
+import com.jetbrains.youtrackdb.internal.core.db.record.record.RID;
+import com.jetbrains.youtrackdb.internal.core.metadata.schema.schema.PropertyType;
+import java.util.NoSuchElementException;
+import javax.annotation.Nullable;
+import org.apache.tinkerpop.gremlin.structure.util.ElementHelper;
+import org.apache.tinkerpop.gremlin.structure.util.StringFactory;
+
+public class YTDBPropertyImpl<V> implements YTDBProperty<V> {
+
+  protected String key;
+  protected V value;
+  protected Object wrappedValue;
+  @Nullable private final PropertyType propertyType;
+  protected YTDBElementImpl element;
+  private boolean removed = false;
+
+  public YTDBPropertyImpl(
+      String key,
+      @Nullable V value,
+      @Nullable PropertyType propertyType,
+      YTDBElementImpl element) {
+    this.key = key;
+    this.value = value;
+    this.element = element;
+    this.wrappedValue = wrapIntoGraphElement(value);
+    this.propertyType = propertyType;
+  }
+
+  private Object wrapIntoGraphElement(V value) {
+    Object result = value;
+    var graph = element.getGraph();
+    var graphTx = graph.tx();
+
+    if (result instanceof RID rid) {
+      var session = graphTx.getDatabaseSession();
+
+      var immutableSchema = session.getMetadata().getImmutableSchemaSnapshot();
+      var cls = immutableSchema.getClassByCollectionId(rid.getCollectionId());
+
+      if (cls.isVertexType()) {
+        return new YTDBVertexImpl(graph, rid);
+      } else if (cls.isEdgeType()) {
+        return new YTDBEdgeImpl(graph, rid);
+      }
+
+      throw new IllegalStateException("Unsupported schema class " + cls.getName());
+    }
+
+    if (result instanceof Entity entity) {
+      if (entity.isVertex()) {
+        result =
+            new YTDBVertexImpl(graph, entity.asVertex());
+      } else if (entity.isEdge()) {
+        result = new YTDBEdgeImpl(graph, entity.asEdge());
+      }
+    }
+
+    return result;
+  }
+
+  @Override
+  public String key() {
+    return key;
+  }
+
+  @Override
+  public V value() throws NoSuchElementException {
+    //noinspection unchecked
+    return (V) wrappedValue;
+  }
+
+  @Override
+  public boolean isPresent() {
+    return !removed;
+  }
+
+  @Override
+  public YTDBElement element() {
+    return this.element;
+  }
+
+  @Override
+  public void remove() {
+    var entity = element.getRawEntity();
+    entity.removeProperty(key);
+    this.value = null;
+    wrappedValue = null;
+    removed = true;
+  }
+
+  @Override
+  public PropertyType type() {
+    return propertyType;
+  }
+
+  @Override
+  public String toString() {
+    return StringFactory.propertyString(this);
+  }
+
+  @SuppressWarnings("EqualsDoesntCheckParameterClass")
+  @Override
+  public boolean equals(final Object object) {
+    return ElementHelper.areEqual(this, object);
+  }
+
+  @Override
+  public int hashCode() {
+    return ElementHelper.hashCode(this);
+  }
+}

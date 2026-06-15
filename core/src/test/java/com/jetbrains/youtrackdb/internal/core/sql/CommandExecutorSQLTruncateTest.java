@@ -1,0 +1,75 @@
+package com.jetbrains.youtrackdb.internal.core.sql;
+
+import static org.junit.Assert.assertEquals;
+
+import com.jetbrains.youtrackdb.internal.DbTestBase;
+import com.jetbrains.youtrackdb.internal.core.id.RecordId;
+import com.jetbrains.youtrackdb.internal.core.metadata.schema.SchemaClassInternal;
+import com.jetbrains.youtrackdb.internal.core.record.impl.EntityImpl;
+import java.io.IOException;
+import org.junit.Test;
+
+public class CommandExecutorSQLTruncateTest extends DbTestBase {
+
+  @Test
+  public void testTruncatePlain() {
+    var vcl = session.getMetadata().getSchema().createClass("A");
+    session.getMetadata().getSchema().createClass("ab", vcl);
+
+    session.begin();
+    session.newEntity("A");
+    session.commit();
+
+    session.begin();
+    session.newEntity("ab");
+    session.commit();
+
+    session.begin();
+    var ret = session.execute("truncate class A ");
+    assertEquals(1L, (long) ret.next().getProperty("count"));
+    session.commit();
+  }
+
+  @Test
+  public void testTruncateAPI() throws IOException {
+    session.getMetadata().getSchema().createClass("A");
+
+    session.begin();
+    session.newEntity("A");
+    session.load(new RecordId(1, 3));
+    session.commit();
+
+    session.begin();
+    session.getMetadata().getSchema().getClasses().stream()
+        .filter(oClass -> !oClass.getName().startsWith("OSecurity")) //
+        .forEach(
+            oClass -> {
+              if (((SchemaClassInternal) oClass).count(session) > 0) {
+                session.execute("truncate class " + oClass.getName() + " POLYMORPHIC UNSAFE")
+                    .close();
+              }
+            });
+    session.commit();
+  }
+
+  @Test
+  public void testTruncatePolimorphic() {
+    var vcl = session.getMetadata().getSchema().createClass("A");
+    session.getMetadata().getSchema().createClass("ab", vcl);
+
+    session.begin();
+    session.newEntity("A");
+    session.commit();
+
+    session.begin();
+    session.newEntity("ab");
+    session.commit();
+
+    session.begin();
+    try (var res = session.execute("truncate class A POLYMORPHIC")) {
+      assertEquals(1L, (long) res.next().getProperty("count"));
+      assertEquals(1L, (long) res.next().getProperty("count"));
+    }
+    session.commit();
+  }
+}

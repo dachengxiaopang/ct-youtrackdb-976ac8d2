@@ -1,0 +1,54 @@
+package com.jetbrains.youtrackdb.internal.core;
+
+import com.jetbrains.youtrackdb.internal.common.log.LogManager;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
+import javax.annotation.Nullable;
+
+public final class YouTrackDBScheduler {
+
+  private volatile boolean active = false;
+
+  public void activate() {
+    active = true;
+  }
+
+  public void shutdown() {
+    active = false;
+  }
+
+  @Nullable
+  public ScheduledFuture<?> scheduleTask(final Runnable task, final long delay,
+      final long period) {
+    // Wrap task to catch throwables and keep periodic tasks alive.
+    // An uncaught exception in scheduleWithFixedDelay silently stops all future executions.
+    Runnable safeTask = () -> {
+      try {
+        task.run();
+      } catch (Throwable e) {
+        LogManager.instance()
+            .error(
+                this,
+                "Error during execution of task " + task.getClass().getSimpleName(),
+                e);
+        // Re-throw errors (OutOfMemoryError, etc.) to stop the task on serious failures.
+        if (e instanceof Error err) {
+          throw err;
+        }
+      }
+    };
+
+    if (!active) {
+      LogManager.instance().warn(this, "YouTrackDB engine is down. Task will not be scheduled.");
+      return null;
+    }
+
+    ScheduledExecutorService pool = YouTrackDBEnginesManager.instance().getScheduledPool();
+    if (period > 0) {
+      return pool.scheduleWithFixedDelay(safeTask, delay, period, TimeUnit.MILLISECONDS);
+    } else {
+      return pool.schedule(safeTask, delay, TimeUnit.MILLISECONDS);
+    }
+  }
+}

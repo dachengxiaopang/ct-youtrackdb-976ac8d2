@@ -1,0 +1,269 @@
+/*
+ *
+ *
+ *  *
+ *  *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  *  you may not use this file except in compliance with the License.
+ *  *  You may obtain a copy of the License at
+ *  *
+ *  *       http://www.apache.org/licenses/LICENSE-2.0
+ *  *
+ *  *  Unless required by applicable law or agreed to in writing, software
+ *  *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  *  See the License for the specific language governing permissions and
+ *  *  limitations under the License.
+ *  *
+ *
+ *
+ */
+package com.jetbrains.youtrackdb.internal.core.storage;
+
+import com.jetbrains.youtrackdb.internal.core.YouTrackDBEnginesManager;
+import com.jetbrains.youtrackdb.internal.core.config.ContextConfiguration;
+import com.jetbrains.youtrackdb.internal.core.conflict.RecordConflictStrategy;
+import com.jetbrains.youtrackdb.internal.core.db.DatabaseSessionEmbedded;
+import com.jetbrains.youtrackdb.internal.core.db.YouTrackDBInternalEmbedded;
+import com.jetbrains.youtrackdb.internal.core.db.record.CurrentStorageComponentsFactory;
+import com.jetbrains.youtrackdb.internal.core.db.record.record.RID;
+import com.jetbrains.youtrackdb.internal.core.id.RecordIdInternal;
+import com.jetbrains.youtrackdb.internal.core.storage.StorageCollection.ATTRIBUTES;
+import com.jetbrains.youtrackdb.internal.core.storage.impl.local.paginated.atomicoperations.AtomicOperation;
+import com.jetbrains.youtrackdb.internal.core.storage.memory.DirectMemoryStorage;
+import com.jetbrains.youtrackdb.internal.core.storage.ridbag.AbsoluteChange;
+import com.jetbrains.youtrackdb.internal.core.storage.ridbag.LinkCollectionsBTreeManager;
+import com.jetbrains.youtrackdb.internal.core.tx.FrontendTransactionImpl;
+import java.io.IOException;
+import java.util.Collection;
+import java.util.Set;
+import java.util.TimeZone;
+import javax.annotation.Nonnull;
+import javax.annotation.Nullable;
+
+/**
+ * This is the gateway interface between the Database side and the storage. Provided implementations
+ * are: Local, Remote and Memory.
+ *
+ * @see DirectMemoryStorage
+ */
+public interface Storage {
+
+  enum STATUS {
+    CLOSED, OPEN, MIGRATION, CLOSING, @Deprecated
+    OPENING,
+  }
+
+  void open(
+      DatabaseSessionEmbedded remote, String iUserName, String iUserPassword,
+      final ContextConfiguration contextConfiguration);
+
+  void create(ContextConfiguration contextConfiguration) throws IOException;
+
+  boolean exists();
+
+  void reload(DatabaseSessionEmbedded database);
+
+  void delete();
+
+  void close(@Nullable DatabaseSessionEmbedded session);
+
+  void close(@Nullable DatabaseSessionEmbedded database, boolean iForce);
+
+  boolean isClosed(DatabaseSessionEmbedded database);
+
+  // CRUD OPERATIONS
+  @SuppressWarnings("unused")
+  @Nonnull
+  StorageReadResult readRecord(RecordIdInternal iRid, @Nonnull AtomicOperation atomicOperation);
+
+  boolean recordExists(DatabaseSessionEmbedded session, RID rid, AtomicOperation atomicOperation);
+
+  @SuppressWarnings("unused")
+  RecordMetadata getRecordMetadata(DatabaseSessionEmbedded session, final RID rid);
+
+  // TX OPERATIONS
+  void commit(FrontendTransactionImpl iTx);
+
+  @SuppressWarnings("unused")
+  Set<String> getCollectionNames();
+
+  @SuppressWarnings("unused")
+  Collection<? extends StorageCollection> getCollectionInstances();
+
+  /**
+   * Add a new collection into the storage.
+   *
+   * @param iCollectionName name of the collection
+   */
+  int addCollection(DatabaseSessionEmbedded database, String iCollectionName,
+      Object... iParameters);
+
+  int getAbsoluteLinkBagCounter(RID ownerId, String fieldName, RID key);
+
+  /**
+   * Add a new collection into the storage.
+   *
+   * @param iCollectionName name of the collection
+   * @param iRequestedId    requested id of the collection
+   */
+  int addCollection(DatabaseSessionEmbedded database, String iCollectionName, int iRequestedId);
+
+  boolean dropCollection(DatabaseSessionEmbedded session, String iCollectionName);
+
+  String getCollectionName(DatabaseSessionEmbedded database, final int collectionId);
+
+  @SuppressWarnings("unused")
+  void setCollectionAttribute(final int id, ATTRIBUTES attribute,
+      Object value);
+
+  /**
+   * Drops a collection.
+   *
+   * @param iId      id of the collection to delete
+   * @return true if has been removed, otherwise false
+   */
+  boolean dropCollection(DatabaseSessionEmbedded database, int iId);
+
+  String getCollectionNameById(final int collectionId);
+
+  String getCollectionRecordConflictStrategy(final int collectionId);
+
+  boolean isSystemCollection(final int collectionId);
+
+  long count(DatabaseSessionEmbedded session, int iCollectionId);
+
+  long count(DatabaseSessionEmbedded session, int iCollectionId, boolean countTombstones);
+
+  long count(DatabaseSessionEmbedded session, int[] iCollectionIds);
+
+  long count(DatabaseSessionEmbedded session, int[] iCollectionIds, boolean countTombstones);
+
+  /**
+   * Returns the approximate number of records in the given collection. The count is maintained
+   * incrementally on each create/delete and is O(1) to read (no page scan). Under snapshot
+   * isolation the value reflects the latest committed state, so concurrent readers whose snapshots
+   * lag behind may observe a slightly stale count.
+   *
+   * @param collectionId the numeric identifier of the collection
+   * @return the approximate record count
+   * @throws com.jetbrains.youtrackdb.internal.core.exception.StorageException if the collection
+   *     does not exist
+   */
+  long getApproximateRecordsCount(int collectionId);
+
+  AbsoluteChange getLinkBagCounter(DatabaseSessionEmbedded session, RecordIdInternal identity,
+      String fieldName, RID rid);
+
+  /**
+   * Returns the approximate total number of records across all collections.
+   *
+   * <p>The result is based on per-collection volatile counters and is not
+   * snapshot-isolated. During concurrent modifications, the total may reflect
+   * a mix of pre- and post-commit states across different collections.
+   */
+  @SuppressWarnings("unused")
+  long countRecords(DatabaseSessionEmbedded session);
+
+  @SuppressWarnings("unused")
+  int getCollectionIdByName(String iCollectionName);
+
+  @SuppressWarnings("unused")
+  String getPhysicalCollectionNameById(int iCollectionId);
+
+  String getName();
+
+  @SuppressWarnings("unused")
+  long getVersion();
+
+  /**
+   * Returns the version of the product release under which this storage was created.
+   *
+   * @return Version of product release under which storage was created.
+   */
+  @SuppressWarnings("unused")
+  String getCreatedAtVersion();
+
+  @SuppressWarnings("unused")
+  void synch();
+
+  @SuppressWarnings("unused")
+  PhysicalPosition[] higherPhysicalPositions(DatabaseSessionEmbedded session, int collectionId,
+      PhysicalPosition physicalPosition, int limit);
+
+  PhysicalPosition[] lowerPhysicalPositions(DatabaseSessionEmbedded session, int collectionId,
+      PhysicalPosition physicalPosition, int limit);
+
+  @SuppressWarnings("unused")
+  PhysicalPosition[] ceilingPhysicalPositions(DatabaseSessionEmbedded session, int collectionId,
+      PhysicalPosition physicalPosition, int limit);
+
+  PhysicalPosition[] floorPhysicalPositions(DatabaseSessionEmbedded session, int collectionId,
+      PhysicalPosition physicalPosition, int limit);
+
+  /**
+   * Returns the current storage's status
+   */
+  @SuppressWarnings("unused")
+  STATUS getStatus();
+
+  /**
+   * Returns the storage's type.
+   */
+  String getType();
+
+  Storage getUnderlying();
+
+  boolean isRemote();
+
+  @SuppressWarnings("unused")
+  boolean isAssigningCollectionIds();
+
+  @SuppressWarnings("unused")
+  LinkCollectionsBTreeManager getLinkCollectionsBtreeCollectionManager();
+
+  CurrentStorageComponentsFactory getComponentsFactory();
+
+  @SuppressWarnings("unused")
+  RecordConflictStrategy getRecordConflictStrategy();
+
+  void setConflictStrategy(RecordConflictStrategy iResolver);
+
+  /**
+   * This method is called in {@link YouTrackDBEnginesManager#shutdown()} method. For most of the
+   * storages it means that storage will be merely closed, but sometimes additional operations are
+   * need to be taken in account.
+   */
+  void shutdown();
+
+  @SuppressWarnings("unused")
+  void setSchemaRecordId(String schemaRecordId);
+
+  void setDateFormat(String dateFormat);
+
+  void setTimeZone(TimeZone timeZoneValue);
+
+  void setLocaleLanguage(String locale);
+
+  void setCharset(String charset);
+
+  @SuppressWarnings("unused")
+  void setIndexMgrRecordId(String indexMgrRecordId);
+
+  void setDateTimeFormat(String dateTimeFormat);
+
+  void setLocaleCountry(String localeCountry);
+
+  void setValidation(boolean validation);
+
+  void removeProperty(String property);
+
+  void setProperty(String property, String value);
+
+  void setRecordSerializer(String recordSerializer, int version);
+
+  void clearProperties();
+
+  int[] getCollectionsIds(Set<String> filterCollections);
+
+  YouTrackDBInternalEmbedded getContext();
+}

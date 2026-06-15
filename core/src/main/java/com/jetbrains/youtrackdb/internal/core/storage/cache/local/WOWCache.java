@@ -1,0 +1,5142 @@
+/*
+ *
+ *
+ *  *
+ *  *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  *  you may not use this file except in compliance with the License.
+ *  *  You may obtain a copy of the License at
+ *  *
+ *  *       http://www.apache.org/licenses/LICENSE-2.0
+ *  *
+ *  *  Unless required by applicable law or agreed to in writing, software
+ *  *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  *  See the License for the specific language governing permissions and
+ *  *  limitations under the License.
+ *  *
+ *
+ *
+ */
+package com.jetbrains.youtrackdb.internal.core.storage.cache.local;
+
+import com.jetbrains.youtrackdb.api.config.GlobalConfiguration;
+import com.jetbrains.youtrackdb.internal.common.collection.closabledictionary.ClosableEntry;
+import com.jetbrains.youtrackdb.internal.common.collection.closabledictionary.ClosableLinkedContainer;
+import com.jetbrains.youtrackdb.internal.common.concur.lock.LockManager;
+import com.jetbrains.youtrackdb.internal.common.concur.lock.PartitionedLockManager;
+import com.jetbrains.youtrackdb.internal.common.concur.lock.ReadersWriterSpinLock;
+import com.jetbrains.youtrackdb.internal.common.concur.lock.ThreadInterruptedException;
+import com.jetbrains.youtrackdb.internal.common.directmemory.ByteBufferPool;
+import com.jetbrains.youtrackdb.internal.common.directmemory.DirectMemoryAllocator;
+import com.jetbrains.youtrackdb.internal.common.directmemory.DirectMemoryAllocator.Intention;
+import com.jetbrains.youtrackdb.internal.common.directmemory.PageFrame;
+import com.jetbrains.youtrackdb.internal.common.directmemory.PageFramePool;
+import com.jetbrains.youtrackdb.internal.common.directmemory.Pointer;
+import com.jetbrains.youtrackdb.internal.common.io.IOUtils;
+import com.jetbrains.youtrackdb.internal.common.log.LogManager;
+import com.jetbrains.youtrackdb.internal.common.serialization.types.IntegerSerializer;
+import com.jetbrains.youtrackdb.internal.common.serialization.types.LongSerializer;
+import com.jetbrains.youtrackdb.internal.common.serialization.types.StringSerializer;
+import com.jetbrains.youtrackdb.internal.common.types.ModifiableBoolean;
+import com.jetbrains.youtrackdb.internal.common.util.RawPair;
+import com.jetbrains.youtrackdb.internal.common.util.RawPairLongObject;
+import com.jetbrains.youtrackdb.internal.core.YouTrackDBEnginesManager;
+import com.jetbrains.youtrackdb.internal.core.command.CommandOutputListener;
+import com.jetbrains.youtrackdb.internal.core.exception.BaseException;
+import com.jetbrains.youtrackdb.internal.core.exception.DatabaseException;
+import com.jetbrains.youtrackdb.internal.core.exception.InvalidStorageEncryptionKeyException;
+import com.jetbrains.youtrackdb.internal.core.exception.SecurityException;
+import com.jetbrains.youtrackdb.internal.core.exception.StorageException;
+import com.jetbrains.youtrackdb.internal.core.exception.WriteCacheException;
+import com.jetbrains.youtrackdb.internal.core.storage.ChecksumMode;
+import com.jetbrains.youtrackdb.internal.core.storage.cache.AbstractWriteCache;
+import com.jetbrains.youtrackdb.internal.core.storage.cache.CachePointer;
+import com.jetbrains.youtrackdb.internal.core.storage.cache.PageDataVerificationError;
+import com.jetbrains.youtrackdb.internal.core.storage.cache.ReadCache;
+import com.jetbrains.youtrackdb.internal.core.storage.cache.WriteCache;
+import com.jetbrains.youtrackdb.internal.core.storage.cache.local.doublewritelog.DoubleWriteLog;
+import com.jetbrains.youtrackdb.internal.core.storage.disk.DiskStorage;
+import com.jetbrains.youtrackdb.internal.core.storage.fs.AsyncFile;
+import com.jetbrains.youtrackdb.internal.core.storage.fs.File;
+import com.jetbrains.youtrackdb.internal.core.storage.fs.IOResult;
+import com.jetbrains.youtrackdb.internal.core.storage.impl.local.PageIsBrokenListener;
+import com.jetbrains.youtrackdb.internal.core.storage.impl.local.paginated.base.DurablePage;
+import com.jetbrains.youtrackdb.internal.core.storage.impl.local.paginated.wal.LogSequenceNumber;
+import com.jetbrains.youtrackdb.internal.core.storage.impl.local.paginated.wal.WriteAheadLog;
+import it.unimi.dsi.fastutil.ints.Int2LongOpenHashMap;
+import it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap;
+import it.unimi.dsi.fastutil.ints.IntArrayList;
+import it.unimi.dsi.fastutil.ints.IntOpenHashSet;
+import it.unimi.dsi.fastutil.longs.Long2ObjectMap;
+import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
+import it.unimi.dsi.fastutil.longs.LongArrayList;
+import it.unimi.dsi.fastutil.objects.Object2LongOpenHashMap;
+import java.io.EOFException;
+import java.io.IOException;
+import java.io.PrintWriter;
+import java.io.StringWriter;
+import java.lang.ref.WeakReference;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.channels.FileChannel;
+import java.nio.file.AtomicMoveNotSupportedException;
+import java.nio.file.FileStore;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
+import java.security.InvalidAlgorithmParameterException;
+import java.security.InvalidKeyException;
+import java.security.NoSuchAlgorithmException;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Random;
+import java.util.Set;
+import java.util.TreeMap;
+import java.util.TreeSet;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.ConcurrentSkipListSet;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Future;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.LongAdder;
+import java.util.zip.CRC32;
+import javax.annotation.Nullable;
+import javax.crypto.BadPaddingException;
+import javax.crypto.Cipher;
+import javax.crypto.IllegalBlockSizeException;
+import javax.crypto.NoSuchPaddingException;
+import javax.crypto.SecretKey;
+import javax.crypto.ShortBufferException;
+import javax.crypto.spec.IvParameterSpec;
+import javax.crypto.spec.SecretKeySpec;
+import net.jpountz.xxhash.XXHash64;
+import net.jpountz.xxhash.XXHashFactory;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+/**
+ * Write part of disk cache which is used to collect pages which were changed on read cache and
+ * store them to the disk in background thread. In current implementation only single background
+ * thread is used to store all changed data, despite of SSD parallelization capabilities we suppose
+ * that better to write data in single big chunk by one thread than by many small chunks from many
+ * threads introducing contention and multi threading overhead. Another reasons for usage of only
+ * one thread are
+ *
+ * <ol>
+ *   <li>That we should give room for readers to read data during data write phase
+ *   <li>It provides much less synchronization overhead
+ * </ol>
+ *
+ * <p>Background thread is running by with predefined intervals. Such approach allows SSD GC to use
+ * pauses to make some clean up of half empty erase blocks. Also write cache is used for checking of
+ * free space left on disk and putting of database in "read mode" if space limit is reached and to
+ * perform fuzzy checkpoints. Write cache holds two different type of pages, pages which are shared
+ * with read cache and pages which belong only to write cache (so called exclusive pages). Files in
+ * write cache are accessed by id , there are two types of ids, internal used inside of write cache
+ * and external used outside of write cache. Presence of two types of ids is caused by the fact that
+ * read cache is global across all storages but each storage has its own write cache. So all ids of
+ * files should be global across whole read cache. External id is created from internal id by
+ * prefixing of internal id (in byte presentation) with bytes of write cache id which is unique
+ * across all storages opened inside of single JVM. Write cache accepts external ids as file ids and
+ * converts them to internal ids inside of its methods.
+ *
+ * @since 7/23/13
+ */
+public final class WOWCache extends AbstractWriteCache
+    implements WriteCache, CachePointer.WritersListener {
+
+  private static final Logger logger = LoggerFactory.getLogger(WOWCache.class);
+
+  private static final String ALGORITHM_NAME = "AES";
+  private static final String TRANSFORMATION = "AES/CTR/NoPadding";
+
+  private static final ThreadLocal<Cipher> CIPHER =
+      ThreadLocal.withInitial(WOWCache::getCipherInstance);
+
+  /**
+   * Extension for the file which contains mapping between file name and file id
+   */
+  private static final String NAME_ID_MAP_EXTENSION = ".cm";
+
+  /**
+   * Name for file which contains first version of binary format
+   */
+  private static final String NAME_ID_MAP_V1 = "name_id_map" + NAME_ID_MAP_EXTENSION;
+
+  /**
+   * Name for file which contains second version of binary format. Second version of format contains
+   * not only file name which is used in write cache but also file name which is used in file system
+   * so those two names may be different which allows usage of case sensitive file names.
+   */
+  private static final String NAME_ID_MAP_V2 = "name_id_map_v2" + NAME_ID_MAP_EXTENSION;
+
+  /**
+   * Name for file which contains third version of binary format. Third version of format contains
+   * not only file name which is used in write cache but also file name which is used in file system
+   * so those two names may be different which allows usage of case sensitive file names. All this
+   * information is wrapped by XX_HASH code which followed by content length, so any damaged records
+   * are filtered out during loading of storage.
+   */
+  private static final String NAME_ID_MAP_V3 = "name_id_map_v3" + NAME_ID_MAP_EXTENSION;
+
+  /**
+   * Name of file temporary which contains third version of binary format. Temporary file is used to
+   * prevent situation when DB is crashed because of migration to third version of binary format and
+   * data are lost.
+   *
+   * @see #NAME_ID_MAP_V3
+   * @see #storedNameIdMapToV3()
+   */
+  private static final String NAME_ID_MAP_V3_T = "name_id_map_v3_t" + NAME_ID_MAP_EXTENSION;
+
+  /**
+   * Name of the file which is used to compact file registry on close. All compacted data will be
+   * written first to this file and then file will be atomically moved on the place of existing
+   * registry.
+   */
+  private static final String NAME_ID_MAP_V2_BACKUP =
+      "name_id_map_v2_backup" + NAME_ID_MAP_EXTENSION;
+
+  /**
+   * Maximum length of the row in file registry
+   *
+   * @see #NAME_ID_MAP_V3
+   */
+  private static final int MAX_FILE_RECORD_LEN = 16 << 10;
+
+  /**
+   * Primary side file for persisting non-durable file IDs.
+   */
+  private static final String NON_DURABLE_FILES = "non_durable_files" + NAME_ID_MAP_EXTENSION;
+
+  /**
+   * Shadow copy of the non-durable files side file. Written first during updates; if the primary
+   * is corrupt on read, the shadow is used as fallback.
+   */
+  private static final String NON_DURABLE_FILES_SHADOW =
+      "non_durable_files_shadow" + NAME_ID_MAP_EXTENSION;
+
+  /**
+   * Binary format version for the non-durable files side file. Format:
+   * {@code [4 bytes version][8 bytes xxHash64][4 bytes count][count × 4 bytes fileId]}
+   */
+  private static final int NON_DURABLE_FILES_VERSION = 1;
+
+  private static final long XX_HASH_SEED = 0xADF678FE45L;
+  private static final XXHash64 XX_HASH_64;
+
+  static {
+    XX_HASH_64 = XXHashFactory.fastestInstance().hash64();
+  }
+
+  /**
+   * Marks pages which have a checksum stored.
+   */
+  public static final long MAGIC_NUMBER_WITH_CHECKSUM = 0xFACB03FEL;
+
+  /**
+   * Marks pages which have a checksum stored and data encrypted
+   */
+  public static final long MAGIC_NUMBER_WITH_CHECKSUM_ENCRYPTED = 0x1L;
+
+  /**
+   * Marks pages which have no checksum stored.
+   */
+  private static final long MAGIC_NUMBER_WITHOUT_CHECKSUM = 0xEF30BCAFL;
+
+  /**
+   * Marks pages which have no checksum stored but have data encrypted
+   */
+  private static final long MAGIC_NUMBER_WITHOUT_CHECKSUM_ENCRYPTED = 0x2L;
+
+  private static final int MAGIC_NUMBER_OFFSET = 0;
+
+  public static final int CHECKSUM_OFFSET = MAGIC_NUMBER_OFFSET + LongSerializer.LONG_SIZE;
+
+  private static final int PAGE_OFFSET_TO_CHECKSUM_FROM =
+      LongSerializer.LONG_SIZE + IntegerSerializer.INT_SIZE;
+
+  private static final int CHUNK_SIZE = 64 * 1024 * 1024;
+
+  /**
+   * Executor which runs in single thread all tasks are related to flush of write cache data.
+   */
+  private static ScheduledExecutorService commitExecutor() {
+    return YouTrackDBEnginesManager.instance().getWowCacheFlushExecutor();
+  }
+
+  /**
+   * Limit of free space on disk after which database will be switched to "read only" mode
+   */
+  private final long freeSpaceLimit =
+      GlobalConfiguration.DISK_CACHE_FREE_SPACE_LIMIT.getValueAsLong() * 1024L * 1024L;
+
+  /**
+   * Listeners which are called once we detect that some of the pages of files are broken.
+   */
+  private final List<WeakReference<PageIsBrokenListener>> pageIsBrokenListeners =
+      new CopyOnWriteArrayList<>();
+
+  /**
+   * Path to the storage root directory where all files served by write cache will be stored
+   */
+  private final Path storagePath;
+
+  private final FileStore fileStore;
+
+  /**
+   * Container of all files are managed by write cache. That is special type of container which
+   * ensures that only limited amount of files is open at the same time and opens closed files upon
+   * request
+   */
+  private final ClosableLinkedContainer<Long, File> files;
+
+  /**
+   * The main storage of pages for write cache. If pages is hold by write cache it should be present
+   * in this map. Map is ordered by position to speed up flush of pages to the disk
+   */
+  private final ConcurrentHashMap<PageKey, CachePointer> writeCachePages =
+      new ConcurrentHashMap<>();
+
+  /**
+   * Storage for the pages which are hold only by write cache and are not shared with read cache.
+   */
+  private final ConcurrentSkipListSet<PageKey> exclusiveWritePages = new ConcurrentSkipListSet<>();
+
+  /**
+   * Container for dirty pages. Dirty pages table is concept taken from ARIES protocol. It contains
+   * earliest LSNs of operations on each page which is potentially changed but not flushed to the
+   * disk. It allows us by calculation of minimal LSN contained by this container calculate which
+   * part of write ahead log may be already truncated. "dirty pages" itself is managed using
+   * following algorithm.
+   *
+   * <ol>
+   *   <li>Just after acquiring the exclusive lock on page we fetch LSN of latest record logged into
+   *       WAL
+   *   <li>If page with given index is absent into table we add it to this container
+   * </ol>
+   *
+   * <p>Because we add last WAL LSN if we are going to modify page, it means that we can calculate
+   * smallest LSN of operation which is not flushed to the log yet without locking of all operations
+   * on database. There is may be situation when thread locks the page but did not add LSN to the
+   * dirty pages table yet. If at the moment of start of iteration over the dirty pages table we
+   * have a non empty dirty pages table it means that new operation on page will have LSN bigger
+   * than any LSN already stored in table. If dirty pages table is empty at the moment of iteration
+   * it means at the moment of start of iteration all page changes were flushed to the disk.
+   */
+  private final ConcurrentHashMap<PageKey, LogSequenceNumber> dirtyPages =
+      new ConcurrentHashMap<>();
+
+  /**
+   * Copy of content of {@link #dirtyPages} table at the moment when
+   * {@link #convertSharedDirtyPagesToLocal()} was called. This field is not thread safe because it
+   * is used inside of tasks which are running inside of {@link #commitExecutor} thread. It is used
+   * to keep results of postprocessing of {@link #dirtyPages} table. Every time we invoke
+   * {@link #convertSharedDirtyPagesToLocal()} all content of dirty pages is removed and copied to
+   * current field and {@link #localDirtyPagesBySegment} filed. Such approach is possible because
+   * {@link #dirtyPages} table is filled by many threads but is read only from inside of
+   * {@link #commitExecutor} thread.
+   */
+  private final HashMap<PageKey, LogSequenceNumber> localDirtyPages = new HashMap<>();
+
+  /**
+   * Copy of content of {@link #dirtyPages} table sorted by log segment and pages sorted by page
+   * index.
+   *
+   * @see #localDirtyPages for details
+   */
+  private final TreeMap<Long, TreeSet<PageKey>> localDirtyPagesBySegment = new TreeMap<>();
+
+  /**
+   * Approximate amount of all pages contained by write cache at the moment
+   */
+  private final AtomicLong writeCacheSize = new AtomicLong();
+
+  /**
+   * Counts invocations of the single-page extend branch of {@link #loadOrAdd}
+   * ({@code pageIndex == currentSize}). Test-only positive-evidence probe: the
+   * regression suite for the original poison-cascade bug uses this counter to prove that a
+   * concurrent-insert workload genuinely exercised the file-extending allocator path, so a
+   * future change that re-routes inserts away from the allocator (and would silently make
+   * an absence-of-symptom assertion "pass" for the wrong reason) fails loud. Incremented at
+   * the end of {@link #loadOrAddExtendBranch} after the successful allocation completes;
+   * never decremented; overflow-safe on {@link LongAdder}'s 64-bit sum. Exposed via the
+   * public {@link #getLoadOrAddExtendBranchInvocationsForTest} accessor for cross-package
+   * test access; not part of the production API surface.
+   */
+  private final LongAdder loadOrAddExtendBranchInvocations = new LongAdder();
+
+  /**
+   * Counts invocations of the multi-page gap-fill branch of {@link #loadOrAdd}
+   * ({@code pageIndex > currentSize}). Test-only positive-evidence probe — see the
+   * {@link #loadOrAddExtendBranchInvocations} Javadoc above for the rationale. Incremented
+   * at the end of {@link #loadOrAddGapFillBranch} after the successful allocation completes.
+   * Primary use is WAL replay, which can reference page indices many pages past the current
+   * file size. Outside replay this counter should not scale with the workload — small
+   * non-zero counts are expected under concurrent inserts due to cross-component
+   * snapshot-window races between the cache-extension reads inside
+   * {@code LocalFreeRangeCache.loadOrAddForWrite} and the cache layer's own
+   * {@code filledUpTo} read. A counter that grows in proportion to workload size signals a
+   * regression in cache-extension coordination.
+   */
+  private final LongAdder loadOrAddGapFillBranchInvocations = new LongAdder();
+
+  /**
+   * Amount of exclusive pages are hold by write cache.
+   */
+  private final AtomicLong exclusiveWriteCacheSize = new AtomicLong();
+
+  /**
+   * Size of single page in cache in bytes.
+   */
+  private final int pageSize;
+
+  /**
+   * WAL instance
+   */
+  private final WriteAheadLog writeAheadLog;
+
+  /**
+   * Lock manager is used to acquire locks in RW mode for cases when we are going to read or write
+   * page from write cache.
+   */
+  private final LockManager<PageKey> lockManager = new PartitionedLockManager<>();
+
+  /**
+   * We acquire lock managed by this manager in read mode if we need to read data from files, and in
+   * write mode if we add/remove/truncate file.
+   */
+  private final ReadersWriterSpinLock filesLock = new ReadersWriterSpinLock();
+
+  /**
+   * Mapping between case sensitive file names are used in write cache and file's internal id. Name
+   * of file in write cache is case sensitive and can be different from file name which is used to
+   * store file in file system.
+   */
+  private final ConcurrentMap<String, Integer> nameIdMap = new ConcurrentHashMap<>();
+
+  /**
+   * Mapping between file's internal ids and case sensitive file names are used in write cache. Name
+   * of file in write cache is case sensitive and can be different from file name which is used to
+   * store file in file system.
+   */
+  private final ConcurrentMap<Integer, String> idNameMap = new ConcurrentHashMap<>();
+
+  private final Random fileIdGen = new Random();
+
+  /**
+   * Path to the file which contains metadata for the files registered in storage.
+   */
+  private Path nameIdMapHolderPath;
+
+  /**
+   * Write cache id , which should be unique across all storages.
+   */
+  private final int id;
+
+  /**
+   * Pool of direct memory <code>ByteBuffer</code>s. We can not use them directly because they do
+   * not have deallocator.
+   */
+  private final ByteBufferPool bufferPool;
+  private final PageFramePool pageFramePool;
+
+  private final String storageName;
+  private final String doubleWriteLogFileName;
+
+  private volatile ChecksumMode checksumMode;
+
+  /**
+   * Error thrown during data flush. Once error registered no more write operations are allowed.
+   */
+  private Throwable flushError;
+
+  /**
+   * IV is used for AES encryption
+   */
+  private final byte[] iv;
+
+  /**
+   * Key is used for AES encryption
+   */
+  private final byte[] aesKey;
+
+  private final int exclusiveWriteCacheMaxSize;
+
+  private final boolean callFsync;
+
+  private final int chunkSize;
+
+  private final long pagesFlushInterval;
+  private volatile boolean stopFlush;
+  private volatile Future<?> flushFuture;
+
+  /**
+   * When {@code true}, the periodic flush task exits early at its entry guard
+   * and does not re-arm itself in the finally block; foreground {@link #flush()}
+   * is unaffected so production checkpoint paths keep working. Toggled only by
+   * {@link #pauseBackgroundFlush()} / {@link #resumeBackgroundFlush()} —
+   * intended for tests that need to read raw storage files without racing the
+   * flusher (torn-page hazard).
+   */
+  private volatile boolean backgroundFlushPaused;
+
+  private final ConcurrentHashMap<ExclusiveFlushTask, CountDownLatch> triggeredTasks =
+      new ConcurrentHashMap<>();
+
+  private final int shutdownTimeout;
+
+  /**
+   * Listeners which are called when exception in background data flush thread is happened.
+   */
+  private final List<WeakReference<BackgroundExceptionListener>> backgroundExceptionListeners =
+      new CopyOnWriteArrayList<>();
+
+  /**
+   * Double write log which is used in write cache to prevent page tearing in case of server crash.
+   */
+  private final DoubleWriteLog doubleWriteLog;
+
+  /**
+   * Set of internal file IDs that are registered as non-durable. Non-durable files participate
+   * in the normal page cache lifecycle but opt out of WAL logging, double-write log protection,
+   * and fsync. Updated via clone-mutate-publish under {@link #filesLock} write lock; readers
+   * access the volatile reference without locking for lock-free O(1) contains checks.
+   */
+  private volatile IntOpenHashSet nonDurableFileIds = new IntOpenHashSet();
+
+  /**
+   * When {@code true}, {@link #deleteFile(long)} skips the per-file
+   * {@link #writeNonDurableRegistry()} call. Set during bulk recovery
+   * ({@link #deleteNonDurableFilesOnRecovery}) to avoid redundant I/O —
+   * the recovery method does a single batch registry write at the end.
+   */
+  private boolean suppressNonDurableRegistryPersist;
+
+  private boolean closed;
+  private final ExecutorService executor;
+
+  private final boolean logFileDeletion;
+
+  public WOWCache(
+      final int pageSize,
+      final boolean logFileDeletion,
+      final ByteBufferPool bufferPool,
+      final WriteAheadLog writeAheadLog,
+      final DoubleWriteLog doubleWriteLog,
+      final long pagesFlushInterval,
+      final int shutdownTimeout,
+      final long exclusiveWriteCacheMaxSize,
+      final Path storagePath,
+      final String storageName,
+      final ClosableLinkedContainer<Long, File> files,
+      final int id, String doubleWriteLogFileName,
+      final ChecksumMode checksumMode,
+      final byte[] iv,
+      final byte[] aesKey,
+      final boolean callFsync,
+      ExecutorService executor) {
+
+    this.logFileDeletion = logFileDeletion;
+    this.doubleWriteLogFileName = doubleWriteLogFileName;
+    if (aesKey != null && aesKey.length != 16 && aesKey.length != 24 && aesKey.length != 32) {
+      throw new InvalidStorageEncryptionKeyException(storageName,
+          "Invalid length of the encryption key, provided size is " + aesKey.length);
+    }
+
+    if (aesKey != null && iv == null) {
+      throw new InvalidStorageEncryptionKeyException(storageName, "IV can not be null");
+    }
+
+    this.shutdownTimeout = shutdownTimeout;
+    this.pagesFlushInterval = pagesFlushInterval;
+    this.iv = iv;
+    this.aesKey = aesKey;
+    this.callFsync = callFsync;
+
+    filesLock.acquireWriteLock();
+    try {
+      this.closed = true;
+
+      this.id = id;
+      this.files = files;
+      this.chunkSize = CHUNK_SIZE / pageSize;
+
+      this.pageSize = pageSize;
+      this.writeAheadLog = writeAheadLog;
+      this.bufferPool = bufferPool;
+      this.pageFramePool = bufferPool.pageFramePool();
+
+      this.checksumMode = checksumMode;
+      this.exclusiveWriteCacheMaxSize = normalizeMemory(exclusiveWriteCacheMaxSize, pageSize);
+
+      this.storagePath = storagePath;
+      try {
+        this.fileStore = Files.getFileStore(this.storagePath);
+      } catch (final IOException e) {
+        throw BaseException.wrapException(
+            new StorageException(storageName, "Error during retrieving of file store"), e,
+            storageName);
+      }
+
+      this.storageName = storageName;
+
+      this.doubleWriteLog = doubleWriteLog;
+
+      if (pagesFlushInterval > 0) {
+        flushFuture =
+            commitExecutor().schedule(
+                new PeriodicFlushTask(this), pagesFlushInterval, TimeUnit.MILLISECONDS);
+      }
+      this.executor = executor;
+    } finally {
+      filesLock.releaseWriteLock();
+    }
+  }
+
+  /**
+   * Loads files already registered in storage. Has to be called before usage of this cache
+   */
+  public void loadRegisteredFiles() throws IOException, java.lang.InterruptedException {
+    filesLock.acquireWriteLock();
+    try {
+      initNameIdMapping();
+
+      doubleWriteLog.open(storageName, doubleWriteLogFileName, storagePath, pageSize);
+
+      closed = false;
+    } finally {
+      filesLock.releaseWriteLock();
+    }
+  }
+
+  /**
+   * Adds listener which is triggered if exception is cast inside background flush data thread.
+   *
+   * @param listener Listener to trigger
+   */
+  @Override
+  public void addBackgroundExceptionListener(final BackgroundExceptionListener listener) {
+    backgroundExceptionListeners.add(new WeakReference<>(listener));
+  }
+
+  /**
+   * Removes listener which is triggered if exception is cast inside background flush data thread.
+   *
+   * @param listener Listener to remove
+   */
+  @Override
+  public void removeBackgroundExceptionListener(final BackgroundExceptionListener listener) {
+    final List<WeakReference<BackgroundExceptionListener>> itemsToRemove = new ArrayList<>(1);
+
+    for (final var ref : backgroundExceptionListeners) {
+      final var l = ref.get();
+      if (l != null && l.equals(listener)) {
+        itemsToRemove.add(ref);
+      }
+    }
+
+    backgroundExceptionListeners.removeAll(itemsToRemove);
+  }
+
+  /**
+   * Fires event about exception is thrown in data flush thread
+   */
+  private void fireBackgroundDataFlushExceptionEvent(final Throwable e) {
+    for (final var ref : backgroundExceptionListeners) {
+      final var listener = ref.get();
+      if (listener != null) {
+        listener.onException(e);
+      }
+    }
+  }
+
+  private static int normalizeMemory(final long maxSize, final int pageSize) {
+    final var tmpMaxSize = maxSize / pageSize;
+    if (tmpMaxSize >= Integer.MAX_VALUE) {
+      return Integer.MAX_VALUE;
+    } else {
+      return (int) tmpMaxSize;
+    }
+  }
+
+  /**
+   * Directory which contains all files managed by write cache.
+   *
+   * @return Directory which contains all files managed by write cache or <code>null</code> in case
+   * of in memory database.
+   */
+  @Override
+  public Path getRootDirectory() {
+    return storagePath;
+  }
+
+  /**
+   * @inheritDoc
+   */
+  @Override
+  public void addPageIsBrokenListener(final PageIsBrokenListener listener) {
+    pageIsBrokenListeners.add(new WeakReference<>(listener));
+  }
+
+  /**
+   * @inheritDoc
+   */
+  @Override
+  public void removePageIsBrokenListener(final PageIsBrokenListener listener) {
+    final List<WeakReference<PageIsBrokenListener>> itemsToRemove = new ArrayList<>(1);
+
+    for (final var ref : pageIsBrokenListeners) {
+      final var pageIsBrokenListener = ref.get();
+
+      if (pageIsBrokenListener == null || pageIsBrokenListener.equals(listener)) {
+        itemsToRemove.add(ref);
+      }
+    }
+
+    pageIsBrokenListeners.removeAll(itemsToRemove);
+  }
+
+  private void callPageIsBrokenListeners(final String fileName, final long pageIndex) {
+    for (final var pageIsBrokenListenerWeakReference : pageIsBrokenListeners) {
+      final var listener = pageIsBrokenListenerWeakReference.get();
+      if (listener != null) {
+        try {
+          listener.pageIsBroken(fileName, pageIndex);
+        } catch (final Exception e) {
+          LogManager.instance()
+              .error(
+                  this,
+                  "Error during notification of page is broken for storage " + storageName,
+                  e);
+        }
+      }
+    }
+  }
+
+  @Override
+  public long bookFileId(final String fileName) {
+    filesLock.acquireWriteLock();
+    try {
+      checkForClose();
+
+      final var fileId = nameIdMap.get(fileName);
+      if (fileId != null) {
+        if (fileId < 0) {
+          return composeFileId(id, -fileId);
+        } else {
+          throw new StorageException(storageName,
+              "File " + fileName + " has already been added to the storage");
+        }
+      }
+      while (true) {
+        final var nextId = fileIdGen.nextInt(Integer.MAX_VALUE - 1) + 1;
+        if (!idNameMap.containsKey(nextId) && !idNameMap.containsKey(-nextId)) {
+          nameIdMap.put(fileName, -nextId);
+          idNameMap.put(-nextId, fileName);
+          return composeFileId(id, nextId);
+        }
+      }
+    } finally {
+      filesLock.releaseWriteLock();
+    }
+  }
+
+  /**
+   * @inheritDoc
+   */
+  @Override
+  public int pageSize() {
+    return pageSize;
+  }
+
+  @Override
+  public long loadFile(final String fileName) throws IOException {
+    filesLock.acquireWriteLock();
+    try {
+      checkForClose();
+
+      var fileId = nameIdMap.get(fileName);
+      final File fileClassic;
+
+      // check that file is already registered
+      if (!(fileId == null || fileId < 0)) {
+        final var externalId = composeFileId(id, fileId);
+        fileClassic = files.get(externalId);
+
+        if (fileClassic != null) {
+          return externalId;
+        } else {
+          throw new StorageException(storageName,
+              "File with given name " + fileName + " only partially registered in storage");
+        }
+      }
+
+      if (fileId == null) {
+        while (true) {
+          final var nextId = fileIdGen.nextInt(Integer.MAX_VALUE - 1) + 1;
+          if (!idNameMap.containsKey(nextId) && !idNameMap.containsKey(-nextId)) {
+            fileId = nextId;
+            break;
+          }
+        }
+      } else {
+        idNameMap.remove(fileId);
+        fileId = -fileId;
+      }
+
+      fileClassic = createFileInstance(fileName, fileId);
+
+      if (!fileClassic.exists()) {
+        throw new StorageException(storageName,
+            "File with name " + fileName + " does not exist in storage " + storageName);
+      } else {
+        // REGISTER THE FILE
+        LogManager.instance()
+            .debug(
+                this,
+                "File '"
+                    + fileName
+                    + "' is not registered in 'file name - id' map, but exists in file system."
+                    + " Registering it",
+                logger);
+
+        openFile(storageName, fileClassic);
+
+        final var externalId = composeFileId(id, fileId);
+        files.add(externalId, fileClassic);
+
+        nameIdMap.put(fileName, fileId);
+        idNameMap.put(fileId, fileName);
+
+        writeNameIdEntry(new NameFileIdEntry(fileName, fileId, fileClassic.getName()), true);
+
+        return externalId;
+      }
+    } catch (final java.lang.InterruptedException e) {
+      throw BaseException.wrapException(
+          new StorageException(storageName, "Load file was interrupted"), e, storageName);
+    } finally {
+      filesLock.releaseWriteLock();
+    }
+  }
+
+  @Override
+  public long addFile(final String fileName) throws IOException {
+    filesLock.acquireWriteLock();
+    try {
+      checkForClose();
+
+      var fileId = nameIdMap.get(fileName);
+      final File fileClassic;
+
+      if (fileId != null && fileId >= 0) {
+        throw new StorageException(storageName,
+            "File with name " + fileName + " already exists in storage " + storageName);
+      }
+
+      if (fileId == null) {
+        while (true) {
+          final var nextId = fileIdGen.nextInt(Integer.MAX_VALUE - 1) + 1;
+          if (!idNameMap.containsKey(nextId) && !idNameMap.containsKey(-nextId)) {
+            fileId = nextId;
+            break;
+          }
+        }
+      } else {
+        idNameMap.remove(fileId);
+        fileId = -fileId;
+      }
+
+      fileClassic = createFileInstance(fileName, fileId);
+      createFile(fileClassic, callFsync);
+
+      final var externalId = composeFileId(id, fileId);
+      files.add(externalId, fileClassic);
+
+      nameIdMap.put(fileName, fileId);
+      idNameMap.put(fileId, fileName);
+
+      writeNameIdEntry(new NameFileIdEntry(fileName, fileId, fileClassic.getName()), true);
+
+      return externalId;
+    } catch (final java.lang.InterruptedException e) {
+      throw BaseException.wrapException(
+          new StorageException(storageName, "File add was interrupted"), e, storageName);
+    } finally {
+      filesLock.releaseWriteLock();
+    }
+  }
+
+  @Override
+  public long fileIdByName(final String fileName) {
+    final var intId = nameIdMap.get(fileName);
+
+    if (intId == null || intId < 0) {
+      return -1;
+    }
+
+    return composeFileId(id, intId);
+  }
+
+  @Override
+  public int internalFileId(final long fileId) {
+    return extractFileId(fileId);
+  }
+
+  @Override
+  public long externalFileId(final int fileId) {
+    return composeFileId(id, fileId);
+  }
+
+  @Override
+  public Long getMinimalNotFlushedSegment() {
+    final var future = commitExecutor().submit(new FindMinDirtySegment(this));
+    try {
+      return future.get();
+    } catch (final Exception e) {
+      throw new IllegalStateException(e);
+    }
+  }
+
+  @Override
+  public void updateDirtyPagesTable(
+      final CachePointer pointer, final LogSequenceNumber startLSN) {
+    final var fileId = pointer.getFileId();
+    final var intFileId = internalFileId(fileId);
+
+    // Non-durable pages must never enter the dirtyPages table — they have no WAL records,
+    // so tracking them would block WAL segment truncation for segments with no durable data.
+    if (nonDurableFileIds.contains(intFileId)) {
+      return;
+    }
+
+    final long pageIndex = pointer.getPageIndex();
+
+    final var pageKey = new PageKey(intFileId, pageIndex);
+
+    LogSequenceNumber dirtyLSN;
+    if (startLSN != null) {
+      dirtyLSN = startLSN;
+    } else {
+      dirtyLSN = writeAheadLog.end();
+    }
+
+    if (dirtyLSN == null) {
+      dirtyLSN = new LogSequenceNumber(0, 0);
+    }
+
+    dirtyPages.putIfAbsent(pageKey, dirtyLSN);
+  }
+
+  @Override
+  public void create() {
+  }
+
+  @Override
+  public void open() {
+  }
+
+  @Override
+  public long addFile(final String fileName, long fileId) throws IOException {
+    return addFile(fileName, fileId, false);
+  }
+
+  @Override
+  public long addFile(final String fileName, long fileId, final boolean nonDurable)
+      throws IOException {
+    filesLock.acquireWriteLock();
+    try {
+      checkForClose();
+
+      File fileClassic;
+
+      final var existingFileId = nameIdMap.get(fileName);
+
+      final var intId = extractFileId(fileId);
+
+      if (existingFileId != null && existingFileId >= 0) {
+        if (existingFileId == intId) {
+          throw new StorageException(storageName,
+              "File with name '" + fileName + "'' already exists in storage '" + storageName + "'");
+        } else {
+          throw new StorageException(storageName,
+              "File with given name '"
+                  + fileName
+                  + "' already exists but has different id "
+                  + existingFileId
+                  + " vs. proposed "
+                  + fileId);
+        }
+      }
+
+      fileId = composeFileId(id, intId);
+      fileClassic = files.get(fileId);
+
+      if (fileClassic != null) {
+        if (!fileClassic.getName().equals(createInternalFileName(fileName, intId))) {
+          throw new StorageException(storageName,
+              "File with given id exists but has different name "
+                  + fileClassic.getName()
+                  + " vs. proposed "
+                  + fileName);
+        }
+
+        fileClassic.shrink(0);
+
+        if (callFsync) {
+          fileClassic.synch();
+        }
+      } else {
+        fileClassic = createFileInstance(fileName, intId);
+        createFile(fileClassic, callFsync);
+
+        files.add(fileId, fileClassic);
+      }
+
+      idNameMap.remove(-intId);
+
+      nameIdMap.put(fileName, intId);
+      idNameMap.put(intId, fileName);
+
+      writeNameIdEntry(new NameFileIdEntry(fileName, intId, fileClassic.getName()), true);
+
+      if (nonDurable) {
+        final var updated = new IntOpenHashSet(nonDurableFileIds);
+        updated.add(intId);
+        nonDurableFileIds = updated;
+        writeNonDurableRegistry();
+      }
+
+      return fileId;
+    } catch (final java.lang.InterruptedException e) {
+      throw BaseException.wrapException(
+          new StorageException(storageName, "File add was interrupted"), e, storageName);
+    } finally {
+      filesLock.releaseWriteLock();
+    }
+  }
+
+  @Override
+  public boolean isNonDurable(final long fileId) {
+    final var intId = extractFileId(fileId);
+    return nonDurableFileIds.contains(intId);
+  }
+
+  @SuppressWarnings("CheckedExceptionNotThrown") // Interface contract declares IOException
+  @Override
+  public IntOpenHashSet deleteNonDurableFilesOnRecovery(
+      final ReadCache readCache) throws IOException {
+    // Snapshot the non-durable IDs under the lock, then release before calling
+    // readCache.deleteFile() — which re-acquires filesLock internally via
+    // WOWCache.deleteFile(). The lock is not reentrant.
+    final IntOpenHashSet deletedIds;
+    filesLock.acquireReadLock();
+    try {
+      final var currentSet = nonDurableFileIds;
+      if (currentSet.isEmpty()) {
+        return new IntOpenHashSet();
+      }
+      deletedIds = new IntOpenHashSet(currentSet);
+    } finally {
+      filesLock.releaseReadLock();
+    }
+
+    // Suppress per-file registry writes during bulk deletion — we do a single
+    // batch write at the end to avoid redundant I/O (each writeNonDurableRegistry
+    // rewrites the side files and may fsync).
+    suppressNonDurableRegistryPersist = true;
+    try {
+      // Delete each non-durable file from both caches (lock-free iteration over snapshot)
+      for (final var intIterator = deletedIds.iterator(); intIterator.hasNext();) {
+        final var intId = intIterator.nextInt();
+        final var externalId = composeFileId(id, intId);
+
+        try {
+          // readCache.deleteFile() clears read cache pages and delegates to
+          // writeCache.deleteFile() which handles disk deletion + name-id map cleanup
+          // + non-durable registry removal under filesLock
+          readCache.deleteFile(externalId, this);
+        } catch (final Exception e) {
+          // Keep the ID in deletedIds so WAL replay skips records for this file.
+          // Non-durable pages were never WAL-logged, so replaying records on top of
+          // stale non-durable data would produce silent corruption. The side file
+          // still contains this ID — the next recovery retries the physical deletion.
+          logger.error(
+              "Failed to delete non-durable file with internal ID {} during crash recovery,"
+                  + " continuing. WAL replay will skip records for this file.",
+              intId,
+              e);
+        }
+      }
+    } finally {
+      suppressNonDurableRegistryPersist = false;
+    }
+
+    // Persist the updated registry under the write lock. If all deletions succeeded,
+    // nonDurableFileIds is already empty (each deleteFile call removed the ID) and
+    // writeNonDurableRegistry() deletes the side files. If some failed, it persists
+    // only the remaining IDs so the next recovery can retry them.
+    // Wrapped in try-catch: the critical work (file deletion) is already done and
+    // deletedIds must be returned so WAL replay can skip the correct records.
+    filesLock.acquireWriteLock();
+    try {
+      writeNonDurableRegistry();
+    } catch (final IOException e) {
+      logger.error(
+          "Failed to persist non-durable registry after crash recovery deletion,"
+              + " stale side files may remain",
+          e);
+    } finally {
+      filesLock.releaseWriteLock();
+    }
+
+    return deletedIds;
+  }
+
+  @Override
+  public boolean checkLowDiskSpace() throws IOException {
+    final var freeSpace = fileStore.getUsableSpace();
+    return freeSpace < freeSpaceLimit;
+  }
+
+  @Override
+  public void syncDataFiles(final long segmentId) throws IOException {
+    filesLock.acquireReadLock();
+    try {
+      checkForClose();
+
+      doubleWriteLog.startCheckpoint();
+      try {
+        for (final var intId : nameIdMap.values()) {
+          if (intId < 0) {
+            continue;
+          }
+
+          // Non-durable files do not need fsync — their data is discarded on crash,
+          // so forcing it to stable storage would be unnecessary write amplification.
+          if (nonDurableFileIds.contains(intId)) {
+            continue;
+          }
+
+          if (callFsync) {
+            final var fileId = composeFileId(id, intId);
+            final var entry = files.acquire(fileId);
+            try {
+              final var fileClassic = entry.get();
+              fileClassic.synch();
+            } finally {
+              files.release(entry);
+            }
+          }
+        }
+
+        writeAheadLog.flush();
+        writeAheadLog.cutAllSegmentsSmallerThan(segmentId);
+      } finally {
+        doubleWriteLog.endCheckpoint();
+      }
+    } catch (final java.lang.InterruptedException e) {
+      throw BaseException.wrapException(
+          new StorageException(storageName, "Fuzzy checkpoint was interrupted"),
+          e, storageName);
+    } finally {
+      filesLock.releaseReadLock();
+    }
+  }
+
+  @Override
+  public void flushTillSegment(final long segmentId) {
+    final var future = commitExecutor().submit(new FlushTillSegmentTask(this, segmentId));
+    try {
+      future.get();
+    } catch (final Exception e) {
+      throw DatabaseException.wrapException(
+          new StorageException(storageName, "Error during data flush"), e, storageName);
+    }
+  }
+
+  @Override
+  public boolean exists(final String fileName) {
+    filesLock.acquireReadLock();
+    try {
+      checkForClose();
+
+      final var intId = nameIdMap.get(fileName);
+      if (intId != null && intId >= 0) {
+        final var fileClassic = files.get(externalFileId(intId));
+
+        if (fileClassic == null) {
+          return false;
+        }
+        return fileClassic.exists();
+      }
+      return false;
+    } finally {
+      filesLock.releaseReadLock();
+    }
+  }
+
+  @Override
+  public boolean exists(long fileId) {
+    filesLock.acquireReadLock();
+    try {
+      checkForClose();
+
+      final var intId = extractFileId(fileId);
+      fileId = composeFileId(id, intId);
+
+      final var file = files.get(fileId);
+      if (file == null) {
+        return false;
+      }
+      return file.exists();
+    } finally {
+      filesLock.releaseReadLock();
+    }
+  }
+
+  @Override
+  public void restoreModeOn() throws IOException {
+    filesLock.acquireWriteLock();
+    try {
+      checkForClose();
+
+      doubleWriteLog.restoreModeOn();
+    } finally {
+      filesLock.releaseWriteLock();
+    }
+  }
+
+  @Override
+  public void restoreModeOff() {
+    filesLock.acquireWriteLock();
+    try {
+      checkForClose();
+
+      doubleWriteLog.restoreModeOff();
+    } finally {
+      filesLock.releaseWriteLock();
+    }
+  }
+
+  @Override
+  public void checkCacheOverflow() throws java.lang.InterruptedException {
+    while (exclusiveWriteCacheSize.get() > exclusiveWriteCacheMaxSize) {
+      final var cacheBoundaryLatch = new CountDownLatch(1);
+      final var completionLatch = new CountDownLatch(1);
+      final var exclusiveFlushTask =
+          new ExclusiveFlushTask(this, cacheBoundaryLatch, completionLatch);
+
+      triggeredTasks.put(exclusiveFlushTask, completionLatch);
+      commitExecutor().submit(exclusiveFlushTask);
+
+      cacheBoundaryLatch.await();
+    }
+  }
+
+  @Override
+  public void store(final long fileId, final long pageIndex, final CachePointer dataPointer) {
+    final var intId = extractFileId(fileId);
+
+    filesLock.acquireReadLock();
+    try {
+      checkForClose();
+
+      final var pageKey = new PageKey(intId, pageIndex);
+
+      final var groupLock = lockManager.acquireExclusiveLock(pageKey);
+      try {
+        final var pagePointer = writeCachePages.get(pageKey);
+
+        if (pagePointer == null) {
+          doPutInCache(dataPointer, pageKey);
+        } else {
+          assert pagePointer.equals(dataPointer);
+        }
+
+      } finally {
+        groupLock.unlock();
+      }
+
+    } finally {
+      filesLock.releaseReadLock();
+    }
+  }
+
+  private void doPutInCache(final CachePointer dataPointer, final PageKey pageKey) {
+    writeCachePages.put(pageKey, dataPointer);
+
+    writeCacheSize.incrementAndGet();
+
+    dataPointer.setWritersListener(this);
+    dataPointer.incrementWritersReferrer();
+  }
+
+  @Override
+  public Map<String, Long> files() {
+    filesLock.acquireReadLock();
+    try {
+      checkForClose();
+
+      final var result = new Object2LongOpenHashMap<String>(1_000);
+      result.defaultReturnValue(-1);
+
+      for (final var entry : nameIdMap.entrySet()) {
+        if (entry.getValue() > 0) {
+          result.put(entry.getKey(), composeFileId(id, entry.getValue()));
+        }
+      }
+
+      return result;
+    } finally {
+      filesLock.releaseReadLock();
+    }
+  }
+
+  @Override
+  public CachePointer load(
+      final long fileId,
+      final long startPageIndex,
+      final ModifiableBoolean cacheHit,
+      final boolean verifyChecksums)
+      throws IOException {
+    final var intId = extractFileId(fileId);
+    filesLock.acquireReadLock();
+    try {
+      checkForClose();
+
+      final var pageKey = new PageKey(intId, startPageIndex);
+      final var pageLock = lockManager.acquireSharedLock(pageKey);
+
+      // check if page already presented in write cache
+      final var pagePointer = writeCachePages.get(pageKey);
+
+      // page is not cached load it from file
+      if (pagePointer == null) {
+        try {
+          // load requested page and preload requested amount of pages
+          final var filePagePointer =
+              loadFileContent(intId, startPageIndex, verifyChecksums);
+          if (filePagePointer != null) {
+            filePagePointer.incrementReadersReferrer();
+          }
+
+          return filePagePointer;
+        } finally {
+          pageLock.unlock();
+        }
+      }
+
+      pagePointer.incrementReadersReferrer();
+      pageLock.unlock();
+
+      cacheHit.setValue(true);
+
+      return pagePointer;
+    } finally {
+      filesLock.releaseReadLock();
+    }
+  }
+
+  /**
+   * Non-extending probe shared by the silent-read code path. Mirrors {@link #load}'s
+   * dirty-write-priority + on-disk-fallback semantics under the {@code lockManager}
+   * shared lock for the {@link PageKey}, but drops the {@code cacheHit} out-parameter
+   * (the silent reader does not track cache hits) and crucially never extends the file
+   * or returns a magic-stamped empty buffer on miss &mdash; that branch belongs to
+   * {@link #loadOrAdd}.
+   *
+   * <p><b>Returns null when:</b> the page is not in the dirty {@code writeCachePages}
+   * map and {@link #loadFileContent} reports the on-disk file is shorter than the
+   * requested {@code pageIndex} (and the double-write log has nothing for that page
+   * either).
+   *
+   * <p><b>Lock ordering:</b> identical to {@link #load} &mdash; acquire
+   * {@link #filesLock} read lock, then the per-{@link PageKey} {@code lockManager}
+   * shared lock; release in reverse order.
+   */
+  @Override
+  public CachePointer loadIfPresent(
+      final long fileId, final long pageIndex, final boolean verifyChecksums) throws IOException {
+    final var intId = extractFileId(fileId);
+    filesLock.acquireReadLock();
+    try {
+      checkForClose();
+
+      final var pageKey = new PageKey(intId, pageIndex);
+      final var pageLock = lockManager.acquireSharedLock(pageKey);
+
+      // Dirty-write priority: a more recent in-memory pointer shadows the on-disk image.
+      final var pagePointer = writeCachePages.get(pageKey);
+
+      if (pagePointer == null) {
+        try {
+          // On-disk fallback. loadFileContent returns null when the file is shorter than
+          // the requested page (and the double-write log has no copy either) — propagate
+          // that null straight back to the caller. Unlike loadOrAdd, we do not extend.
+          final var filePagePointer = loadFileContent(intId, pageIndex, verifyChecksums);
+          if (filePagePointer != null) {
+            filePagePointer.incrementReadersReferrer();
+          }
+
+          return filePagePointer;
+        } finally {
+          pageLock.unlock();
+        }
+      }
+
+      pagePointer.incrementReadersReferrer();
+      pageLock.unlock();
+
+      return pagePointer;
+    } finally {
+      filesLock.releaseReadLock();
+    }
+  }
+
+  /**
+   * Total page-access primitive: returns a usable {@link CachePointer} for the given
+   * {@code (fileId, pageIndex)} regardless of whether the page already exists on disk.
+   *
+   * <p>The implementation reads the in-memory {@link AsyncFile} size once into
+   * {@code currentSize} (in pages) and dispatches to one of three branches:
+   *
+   * <ul>
+   *   <li>{@code pageIndex < currentSize} &mdash; <b>load existing</b>. Acquires the
+   *       per-{@link PageKey} shared lock from {@code lockManager} (the same lock today's
+   *       {@code load} takes to serialize against {@code doRemoveCachePages} and
+   *       {@code flushExclusiveWriteCache}), probes the dirty {@code writeCachePages} map
+   *       first &mdash; if a more recent dirty pointer is sitting there, returning it takes
+   *       priority over an older on-disk version &mdash; and falls through to
+   *       {@code loadFileContent} on miss. The {@code loadFileContent}-returns-null branch
+   *       is defensive dead code today: with {@code pageIndex < currentSize} the test
+   *       {@code fileClassic.getFileSize() < pageEndPosition} cannot fire, because both
+   *       sides read the same in-memory {@link AsyncFile#getFileSize}. The fallback is
+   *       preserved to absorb future divergence (sparse-region misses, DWL recovery flows
+   *       that surface a null) without breaking the totality contract.
+   *   <li>{@code pageIndex == currentSize} &mdash; <b>one-page extend</b>. Calls
+   *       {@link AsyncFile#allocateSpace} (atomic {@code getAndAdd}), submits a single
+   *       {@link EnsurePageIsValidInFileTask} on the {@code wowCacheFlushExecutor}
+   *       (single-threaded, FIFO order across submissions), and returns a freshly-allocated
+   *       empty {@link CachePointer}. The {@code lockManager} shared lock is <b>not</b>
+   *       taken here: a freshly-installed pointer cannot race with concurrent flush until
+   *       the caller's outer {@code data.compute} segment write lock publishes it.
+   *   <li>{@code pageIndex > currentSize} &mdash; <b>multi-page gap-fill</b> (recovery
+   *       only). Calls {@link AsyncFile#allocateSpace} once for {@code (pageIndex -
+   *       currentSize + 1) * pageSize} bytes, submits an
+   *       {@link EnsurePageIsValidInFileTask} for every gap page in
+   *       {@code [currentSize, pageIndex]}, and returns the {@link CachePointer} for the
+   *       requested {@code pageIndex} only. The intermediate gap pages are stamped on disk
+   *       but not held in the read cache. Like the extend branch, the {@code lockManager}
+   *       shared lock is not taken: the caller's outer {@code data.compute} segment write
+   *       lock publishes the freshly-installed pointer before any concurrent flush could
+   *       observe it.
+   * </ul>
+   *
+   * <p><b>Totality contract.</b> The method never returns {@code null} for any open,
+   * non-deleted file. The only way the contract breaks is if the file was concurrently
+   * deleted by an unrelated thread, in which case {@code loadFileContent} surfaces an
+   * {@link IllegalArgumentException} that propagates raw to the caller as a caller-bug
+   * signal &mdash; the totality contract holds for the documented usage (caller still owns
+   * the fileId). A defensive {@link IllegalArgumentException} guard at the dispatch prelude
+   * also fires when the dispatch prelude itself observes a missing entry for {@code fileId}
+   * before {@code loadFileContent} would have a chance to.
+   *
+   * <p><b>Caller precondition.</b> The caller holds the segment write lock for the
+   * {@code (fileId, pageIndex)} key. The production caller is
+   * {@link com.jetbrains.youtrackdb.internal.core.storage.cache.chm.LockFreeReadCache#doLoad},
+   * shared by {@code loadForRead} and {@code loadOrAddForWrite}, which calls this method from
+   * inside {@code data.compute(fileId, pageIndex, ...)} so the segment write lock is held
+   * across the call. Lock ordering inside this method:
+   * acquire {@link #filesLock} read lock; on the load branch additionally acquire the
+   * {@code lockManager} shared lock for the {@link PageKey}; the dispatch prelude opens
+   * one {@code files.acquire(fileId)} cycle and the chosen branch reuses the same handle
+   * (load branch releases before delegating to {@code loadFileContent}, which re-acquires
+   * internally; extend / gap-fill branches keep the handle open across
+   * {@link AsyncFile#allocateSpace}).
+   *
+   * <p><b>Magic stamp.</b> The returned {@link CachePointer} on the extend / gap-fill
+   * branches contains an in-memory empty buffer with LSN {@code (-1,-1)}; the on-disk
+   * magic stamp is written asynchronously by {@link EnsurePageIsValidInFileTask}. The
+   * task is idempotent (it only writes when the underlying file is shorter than the page
+   * offset), so resubmissions on the gap-fill branch are safe.
+   */
+  @Override
+  public CachePointer loadOrAdd(
+      final long fileId, final long pageIndex, final boolean verifyChecksums)
+      throws IOException {
+    if (pageIndex < 0) {
+      throw new IllegalArgumentException("Illegal page index value " + pageIndex);
+    }
+    final var intId = extractFileId(fileId);
+    filesLock.acquireReadLock();
+    try {
+      checkForClose();
+
+      // Single files.acquire / files.release cycle covers the whole call: the dispatch
+      // prelude reads AsyncFile.size for branch selection; the load branch releases before
+      // delegating to loadFileContent (which re-acquires internally); the extend / gap-fill
+      // branches keep the handle open across allocateSpace and release on the way out.
+      final var entry = files.acquire(fileId);
+      // Defensive guard against a concurrently-deleted / never-registered fileId. The
+      // ClosableLinkedContainer returns null for an unknown key; a subsequent entry.get()
+      // would NPE before the totality / IllegalArgumentException contract surfaces. Mirror
+      // loadFileContent's existing guard so the deleted-file caller-bug signal is symmetric
+      // across the two paths.
+      if (entry == null) {
+        throw new IllegalArgumentException(
+            "File with id " + intId + " not found in WOW Cache");
+      }
+      var entryConsumed = false;
+      try {
+        final var fileClassic = entry.get();
+        if (fileClassic == null) {
+          throw new IllegalArgumentException(
+              "File with id " + intId + " not found in WOW Cache");
+        }
+        // currentSize is in pages; the value is consistent within the call but other
+        // threads may extend the file concurrently (different pageIndex keys are not
+        // serialized by data.compute).
+        final var currentSize = fileClassic.getFileSize() / pageSize;
+        if (pageIndex < currentSize) {
+          // Release the dispatch handle before the load branch: loadFileContent re-acquires
+          // internally, so holding it across the call would double-acquire.
+          files.release(entry);
+          entryConsumed = true;
+          return loadOrAddLoadBranch(intId, pageIndex, verifyChecksums);
+        }
+        if (pageIndex == currentSize) {
+          return loadOrAddExtendBranch(intId, pageIndex, fileClassic);
+        }
+        // pageIndex > currentSize: gap-fill (recovery-only path under normal callers).
+        return loadOrAddGapFillBranch(intId, pageIndex, currentSize, fileClassic);
+      } finally {
+        if (!entryConsumed) {
+          files.release(entry);
+        }
+      }
+    } catch (final java.lang.InterruptedException e) {
+      throw BaseException.wrapException(
+          new StorageException(storageName, "loadOrAdd was interrupted"), e, storageName);
+    } finally {
+      filesLock.releaseReadLock();
+    }
+  }
+
+  /**
+   * Load branch of {@link #loadOrAdd}: {@code pageIndex < currentSize}.
+   *
+   * <p>Probes the dirty-write map first (so a fresh in-memory page wins over its older
+   * on-disk image), then falls through to {@code loadFileContent}. The
+   * {@code loadFileContent}-returns-null branch is defensive dead code today: given
+   * {@code pageIndex < currentSize} and that both dispatch prelude and {@code loadFileContent}
+   * read the same in-memory {@link AsyncFile#getFileSize}, the
+   * {@code fileClassic.getFileSize() < pageEndPosition} test inside {@code loadFileContent}
+   * cannot fire on this path. The fallback is preserved to absorb future divergence
+   * (e.g., {@code loadFileContent} taught to surface sparse-region misses, or DWL
+   * recovery flows that return null) without breaking the totality contract.
+   */
+  private CachePointer loadOrAddLoadBranch(
+      final int intId, final long pageIndex, final boolean verifyChecksums) throws IOException {
+    final var pageKey = new PageKey(intId, pageIndex);
+    final var pageLock = lockManager.acquireSharedLock(pageKey);
+
+    // Dirty-write priority: a more recent in-memory pointer wins over the on-disk image.
+    final var pagePointer = writeCachePages.get(pageKey);
+    if (pagePointer != null) {
+      pagePointer.incrementReadersReferrer();
+      pageLock.unlock();
+      return pagePointer;
+    }
+
+    try {
+      final var filePagePointer = loadFileContent(intId, pageIndex, verifyChecksums);
+      if (filePagePointer != null) {
+        filePagePointer.incrementReadersReferrer();
+        return filePagePointer;
+      }
+      // Defensive totality fallback (dead code today; see method Javadoc): if
+      // loadFileContent ever returns null on this path, return a magic-stamped empty
+      // buffer without bumping AsyncFile.size so the totality contract holds.
+      //
+      // The assert surfaces a dispatch-prelude invariant regression in -ea test runs at
+      // zero production cost: pageIndex < currentSize and loadFileContent share the same
+      // AsyncFile.getFileSize read, so the loadFileContent-returns-null branch cannot fire
+      // under the current implementation. If a future change (sparse-region misses, DWL
+      // recovery flows, etc.) makes the fallback live, remove the assert.
+      assert false
+          : "loadFileContent returned null on load branch — dispatch prelude invariant"
+              + " violated; pageIndex < currentSize should always find a page on disk"
+              + " (intId=" + intId + " pageIndex=" + pageIndex + ")";
+      return newEmptyCachePointer(composeFileId(id, intId), pageIndex);
+    } finally {
+      pageLock.unlock();
+    }
+  }
+
+  /**
+   * One-page extend branch of {@link #loadOrAdd}: {@code pageIndex == currentSize}.
+   *
+   * <p>Allocates one page worth of space in the file (atomic {@code getAndAdd}), submits
+   * an idempotent {@link EnsurePageIsValidInFileTask} for the single allocated page,
+   * returns a magic-stamped empty {@link CachePointer}. No {@code lockManager} shared
+   * lock is taken: the caller's outer {@code data.compute} segment write lock publishes
+   * the freshly-installed pointer before any concurrent flush could observe it.
+   *
+   * <p>The {@code fileClassic} reference is supplied by the dispatch prelude under a
+   * single {@code files.acquire(fileId)} handle held across this branch; the helper does
+   * not re-acquire.
+   */
+  private CachePointer loadOrAddExtendBranch(
+      final int intId, final long pageIndex, final File fileClassic) throws IOException {
+    final var allocatedPosition = fileClassic.allocateSpace(pageSize);
+    final long allocatedIndex = allocatedPosition / pageSize;
+    if (allocatedIndex < 0) {
+      throw new IllegalStateException("Illegal page index value " + allocatedIndex);
+    }
+    // Hard sanity: callers compute pageIndex as entryPoint.pagesSize + 1, which by the
+    // runtime invariant equals the current AsyncFile size in pages (no concurrent
+    // allocator on the same file). If a concurrent allocator on a different pageIndex
+    // raced ahead between our currentSize read and allocateSpace, the equality still
+    // holds because allocateSpace is monotonic getAndAdd: a different caller would
+    // already have seen our extension and routed to gap-fill instead. The check is a
+    // hard throw rather than a Java assert so that a violation of the per-component
+    // single-allocator invariant fails fast in production builds (no -ea).
+    if (allocatedIndex != pageIndex) {
+      throw new IllegalStateException(
+          "loadOrAdd extend branch: allocated pageIndex "
+              + allocatedIndex
+              + " does not match requested pageIndex "
+              + pageIndex);
+    }
+    commitExecutor()
+        .submit(new EnsurePageIsValidInFileTask(intId, (int) pageIndex, this));
+    // Positive-evidence probe — see field Javadoc. Counted at the end of the branch so a
+    // throw from allocateSpace, the hard sanity check above, or the EnsurePageIsValidInFileTask
+    // submission does not record a spurious increment.
+    loadOrAddExtendBranchInvocations.increment();
+    return newEmptyCachePointer(composeFileId(id, intId), pageIndex);
+  }
+
+  /**
+   * Multi-page gap-fill branch of {@link #loadOrAdd}: {@code pageIndex > currentSize}.
+   *
+   * <p>Recovery-only path under normal callers (WAL replay can reference page indices
+   * many pages beyond the current file size on a freshly-reopened storage). Allocates
+   * {@code (pageIndex - currentSize + 1)} pages in one batched
+   * {@link AsyncFile#allocateSpace} call, submits one
+   * {@link EnsurePageIsValidInFileTask} per gap page in {@code [currentSize, pageIndex]},
+   * and returns the {@link CachePointer} for the target page only. The intermediate gap
+   * pages are stamped on disk but never installed in the read cache by this method.
+   *
+   * <p>The {@code fileClassic} reference is supplied by the dispatch prelude under a
+   * single {@code files.acquire(fileId)} handle held across this branch; the helper does
+   * not re-acquire.
+   */
+  private CachePointer loadOrAddGapFillBranch(
+      final int intId, final long pageIndex, final long currentSize, final File fileClassic)
+      throws IOException {
+    final long pagesToAllocate = pageIndex - currentSize + 1L;
+    final long requestedBytes = pagesToAllocate * pageSize;
+    if (requestedBytes > Integer.MAX_VALUE) {
+      throw new StorageException(
+          storageName,
+          "loadOrAdd gap-fill: requested allocation "
+              + requestedBytes
+              + " bytes exceeds AsyncFile.allocateSpace int limit (currentSize="
+              + currentSize
+              + ", pageIndex="
+              + pageIndex
+              + ")");
+    }
+    final var allocatedPosition = fileClassic.allocateSpace((int) requestedBytes);
+    final long allocatedStartIndex = allocatedPosition / pageSize;
+    if (allocatedStartIndex < 0) {
+      throw new IllegalStateException("Illegal page index value " + allocatedStartIndex);
+    }
+    // Hard sanity: for the runtime caller invariant (single allocator per file at a time)
+    // the allocated start index equals currentSize. Concurrent allocators on different
+    // pageIndex keys would already have observed our gap-fill via AsyncFile.size and
+    // routed to a different branch. The check is a hard throw rather than a Java assert
+    // so that a violation of the per-component single-allocator invariant fails fast in
+    // production builds (no -ea).
+    if (allocatedStartIndex != currentSize) {
+      throw new IllegalStateException(
+          "loadOrAdd gap-fill branch: allocated start index "
+              + allocatedStartIndex
+              + " does not match currentSize "
+              + currentSize);
+    }
+    // Submit EnsurePageIsValidInFileTask for every gap page (including the target).
+    // The single-threaded wowCacheFlushExecutor preserves submission order so the gap
+    // pages stamp in ascending order. Each task is idempotent (writeValidPageInFile
+    // only writes if the underlying file is shorter than the page offset), so a
+    // resubmission against an already-stamped page is a no-op.
+    for (long gapPage = currentSize; gapPage <= pageIndex; gapPage++) {
+      commitExecutor()
+          .submit(new EnsurePageIsValidInFileTask(intId, (int) gapPage, this));
+    }
+    // Positive-evidence probe — see field Javadoc. Counted at the end of the branch so a
+    // throw from allocateSpace or the hard sanity check above does not record a spurious
+    // increment.
+    loadOrAddGapFillBranchInvocations.increment();
+    return newEmptyCachePointer(composeFileId(id, intId), pageIndex);
+  }
+
+  /**
+   * Returns a freshly-allocated, cleared {@link CachePointer} for the extend / gap-fill
+   * branches and for the load-branch totality fallback. The buffer is zero-filled; LSN
+   * is initialised to {@code (-1,-1)}; the readers-referrer count is incremented so the
+   * caller's release path balances correctly.
+   */
+  private CachePointer newEmptyCachePointer(final long fileId, final long pageIndex) {
+    // Use ADD_NEW_PAGE_IN_DISK_CACHE to match the legacy read-cache install pattern in
+    // LockFreeReadCache.addNewPagePointerToTheCache; the disk-stamp executor path uses
+    // ADD_NEW_PAGE_IN_FILE separately, and mixing the two would collapse memory-accounting
+    // buckets in profiling.
+    final var pageFrame =
+        pageFramePool.acquire(true, Intention.ADD_NEW_PAGE_IN_DISK_CACHE);
+    DurablePage.setLogSequenceNumberForPage(
+        pageFrame.getBuffer(), new LogSequenceNumber(-1, -1));
+    final var cachePointer = new CachePointer(pageFrame, pageFramePool, fileId, (int) pageIndex);
+    cachePointer.incrementReadersReferrer();
+    return cachePointer;
+  }
+
+  @Override
+  public void addOnlyWriters(final long fileId, final long pageIndex) {
+    exclusiveWriteCacheSize.incrementAndGet();
+    exclusiveWritePages.add(new PageKey(extractFileId(fileId), pageIndex));
+  }
+
+  @Override
+  public void removeOnlyWriters(final long fileId, final long pageIndex) {
+    exclusiveWriteCacheSize.decrementAndGet();
+    exclusiveWritePages.remove(new PageKey(extractFileId(fileId), pageIndex));
+  }
+
+  @Override
+  public void flush(final long fileId) {
+    final var future =
+        commitExecutor().submit(
+            new FileFlushTask(this, Collections.singleton(extractFileId(fileId))));
+    try {
+      future.get();
+    } catch (final java.lang.InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw BaseException.wrapException(
+          new ThreadInterruptedException("File flush was interrupted"), e, storageName);
+    } catch (final Exception e) {
+      throw BaseException.wrapException(
+          new WriteCacheException(storageName, "File flush was abnormally terminated"), e,
+          storageName);
+    }
+  }
+
+  @Override
+  public void flush() {
+
+    final var future = commitExecutor().submit(new FileFlushTask(this, nameIdMap.values()));
+    try {
+      future.get();
+    } catch (final java.lang.InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw BaseException.wrapException(
+          new ThreadInterruptedException("File flush was interrupted"), e, storageName);
+    } catch (final Exception e) {
+      throw BaseException.wrapException(
+          new WriteCacheException(storageName, "File flush was abnormally terminated"), e,
+          storageName);
+    }
+  }
+
+  @Override
+  public void pauseBackgroundFlush() {
+    // Setting the flag first ensures any periodic flush that fires after this
+    // point sees backgroundFlushPaused == true at the entry guard in
+    // executePeriodicFlush and exits without doing any I/O or re-arming.
+    backgroundFlushPaused = true;
+
+    // Submit a no-op task to the single-threaded commitExecutor and wait for
+    // it. Because the executor is single-threaded, by the time our barrier
+    // task returns, any periodic flush that was already running has fully
+    // returned, including waiting on every in-flight AsynchronousFileChannel
+    // write: partitionAndFlushChunks calls IOResult.await() on every queued
+    // write before returning, so no async page write is outstanding once
+    // executePeriodicFlush has returned. Periodic tasks that were merely
+    // scheduled (not yet running) will see the flag at the entry guard and
+    // exit without doing work, so no work is queued behind the barrier
+    // either.
+    final var barrier = submitPauseBarrier();
+    try {
+      barrier.get();
+    } catch (final java.lang.InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw BaseException.wrapException(
+          new ThreadInterruptedException("Pausing background flush was interrupted"),
+          e, storageName);
+    } catch (final ExecutionException e) {
+      throw BaseException.wrapException(
+          new WriteCacheException(storageName, "Pause barrier failed"), e, storageName);
+    }
+
+    // Cancel any periodic future that the just-finished invocation re-armed
+    // before its finally observed the flag write, OR that an even earlier
+    // periodic invocation scheduled and we never had a chance to gate. We
+    // can safely cancel(false) here: on a queued-but-not-started task it
+    // removes the task from the executor's delay queue; on the currently
+    // running task it only sets the cancelled bit (the task continues, but
+    // its entry guard and finally re-arm both see the flag and skip work).
+    // Without this, a fast PeriodicFlushTask.run() could return before the
+    // queued task fired, leaving an orphan chain in the queue that
+    // resumeBackgroundFlush would then duplicate.
+    final var pending = flushFuture;
+    if (pending != null) {
+      pending.cancel(false);
+    }
+  }
+
+  @Override
+  public void resumeBackgroundFlush() {
+    if (!backgroundFlushPaused) {
+      return;
+    }
+    backgroundFlushPaused = false;
+
+    // The periodic task that ran during the pause window saw the flag in its
+    // finally block and skipped its re-schedule. Restart it explicitly so
+    // background flushing resumes. If pagesFlushInterval == 0 or the cache
+    // has been closed (stopFlush == true), stay idle — matching the
+    // constructor's gating at construction time.
+    if (pagesFlushInterval > 0 && !stopFlush) {
+      flushFuture = scheduleResumeFlush();
+    }
+  }
+
+  // Package-private test seam: submit the barrier no-op task used by
+  // pauseBackgroundFlush(). Extracted so unit tests can stub the executor
+  // interaction (the real commitExecutor() is a global singleton fetched
+  // via YouTrackDBEnginesManager and cannot be mocked). Production
+  // behavior is identical to inlining commitExecutor().submit(() -> null).
+  Future<?> submitPauseBarrier() {
+    return commitExecutor().submit(() -> null);
+  }
+
+  // Package-private test seam: schedule the periodic flush task used by
+  // resumeBackgroundFlush(). Extracted so unit tests can verify that the
+  // schedule branch is taken without depending on the real executor.
+  // Production behavior is identical to inlining the
+  // commitExecutor().schedule(...) call.
+  Future<?> scheduleResumeFlush() {
+    return commitExecutor().schedule(
+        new PeriodicFlushTask(this), pagesFlushInterval, TimeUnit.MILLISECONDS);
+  }
+
+  // Retained internal site: the WriteCache implementer must keep this override so the
+  // documented internal callers (LFRC.doLoad, AOBT.{allocatePageForWrite, filledUpTo},
+  // the Layer A helper body just below) dispatch to a concrete impl. The "deprecation"
+  // suppression silences the deprecation warning the override would otherwise inherit
+  // from the @Deprecated interface declaration.
+  @SuppressWarnings("deprecation")
+  @Override
+  public long getFilledUpTo(long fileId) {
+    final var intId = extractFileId(fileId);
+    fileId = composeFileId(id, intId);
+
+    filesLock.acquireReadLock();
+    try {
+      checkForClose();
+
+      var file = files.get(fileId);
+      // File may be null if it was concurrently deleted (e.g., during storage
+      // close/drop while the periodic records GC is still running). Return 0
+      // to indicate no pages — callers such as CollectionDirtyPageBitSet treat
+      // this as a no-op, avoiding an NPE that would poison the storage error
+      // state and hang the shutdown.
+      if (file == null) {
+        return 0;
+      }
+      return file.getFileSize() / pageSize;
+    } finally {
+      filesLock.releaseReadLock();
+    }
+  }
+
+  // Layer A helper body: this is the named gated entry point for the post-unfreeze
+  // backup snapshot reader and wraps the @Deprecated getFilledUpTo. Listed on the
+  // WriteCache.getFilledUpTo Javadoc as a retained internal caller.
+  @SuppressWarnings("deprecation")
+  @Override
+  public long physicalSizeForBackupSnapshot(long fileId) {
+    // Thin delegator — the wrapped call re-acquires filesLock as a read lock and applies
+    // the null-file safety (returns 0 when the file was concurrently deleted). The
+    // semantic difference is the audit-grep contract documented on the WriteCache
+    // interface method, not the locking or branching shape.
+    return getFilledUpTo(fileId);
+  }
+
+  @Override
+  public long getExclusiveWriteCachePagesSize() {
+    return exclusiveWriteCacheSize.get();
+  }
+
+  /**
+   * Test-only accessor: number of times the single-page extend branch of
+   * {@link #loadOrAdd} has run to completion (post-allocate, post-sanity-check) since this
+   * cache instance was constructed. The regression suite for the original poison-cascade
+   * bug uses this counter to prove a concurrent-insert workload actually exercised the
+   * file-extending allocator path (so a future change that re-routes inserts elsewhere
+   * fails loud rather than silently "passing" an absence-of-symptom assertion). Not part
+   * of the production API surface — callers outside the regression suite should not
+   * depend on this method.
+   *
+   * <p>The {@code ForTest} suffix is intentional: it makes the test-only intent visible at
+   * every call site (the production code never reads this counter; only the regression
+   * tests do).
+   */
+  public long getLoadOrAddExtendBranchInvocationsForTest() {
+    return loadOrAddExtendBranchInvocations.sum();
+  }
+
+  /**
+   * Test-only accessor: number of times the multi-page gap-fill branch of
+   * {@link #loadOrAdd} has run to completion (post-allocate, post-sanity-check) since this
+   * cache instance was constructed. Mirrors
+   * {@link #getLoadOrAddExtendBranchInvocationsForTest}. Outside WAL replay this counter
+   * should not scale with workload size — small non-zero counts are expected under
+   * concurrent inserts due to cross-component snapshot windows; a counter that grows in
+   * proportion to workload size signals a regression in cache-extension coordination.
+   */
+  public long getLoadOrAddGapFillBranchInvocationsForTest() {
+    return loadOrAddGapFillBranchInvocations.sum();
+  }
+
+  @Override
+  public void deleteFile(final long fileId) throws IOException {
+    final var intId = extractFileId(fileId);
+
+    filesLock.acquireWriteLock();
+    try {
+      checkForClose();
+
+      final RawPair<String, String> file;
+      final var future =
+          commitExecutor().submit(new DeleteFileTask(this, fileId));
+      try {
+        file = future.get();
+      } catch (final java.lang.InterruptedException e) {
+        throw BaseException.wrapException(
+            new ThreadInterruptedException("File data removal was interrupted"), e, storageName);
+      } catch (final Exception e) {
+        throw BaseException.wrapException(
+            new WriteCacheException(storageName, "File data removal was abnormally terminated"), e,
+            storageName);
+      }
+
+      if (file != null) {
+        // Remove from non-durable registry if present (clone-mutate-publish under filesLock)
+        if (nonDurableFileIds.contains(intId)) {
+          final var updated = new IntOpenHashSet(nonDurableFileIds);
+          updated.remove(intId);
+          nonDurableFileIds = updated;
+
+          // During bulk recovery the caller batches a single registry write at the end,
+          // so skip the per-file I/O here to avoid redundant fsync overhead.
+          if (!suppressNonDurableRegistryPersist) {
+            writeNonDurableRegistry();
+          }
+        }
+
+        writeNameIdEntry(new NameFileIdEntry(file.first(), -intId, file.second()), true);
+      }
+    } finally {
+      filesLock.releaseWriteLock();
+    }
+  }
+
+  @Override
+  public void truncateFile(long fileId) throws IOException {
+    final var intId = extractFileId(fileId);
+    fileId = composeFileId(id, intId);
+
+    filesLock.acquireWriteLock();
+    try {
+      checkForClose();
+
+      removeCachedPages(intId);
+      final var entry = files.acquire(fileId);
+      try {
+        entry.get().shrink(0);
+      } finally {
+        files.release(entry);
+      }
+    } catch (final java.lang.InterruptedException e) {
+      throw BaseException.wrapException(
+          new StorageException(storageName, "File truncation was interrupted"),
+          e, storageName);
+    } finally {
+      filesLock.releaseWriteLock();
+    }
+  }
+
+  @Override
+  public boolean shrinkFile(long fileId, final long targetBytes) throws IOException {
+    // Argument-validity guards run BEFORE any locking or pre-flight no-op so a contract
+    // violation never lands a partial truncate and never racily competes with concurrent
+    // file writers for filesLock. These checks run under default JVM flags (no -ea) — the
+    // recovery-time orphan-truncation path runs once per storage open, so an unconditional
+    // IllegalArgumentException is cheaper than the cost of a silent half-page truncate or
+    // a runaway range purge.
+    //
+    //  - Non-negative: catches arithmetic underflow at the call site (a negative target
+    //    would either bottom out in AsyncFile.shrink or, after the (int) cast, produce a
+    //    negative minPageIndex that the downstream range filter (pageIndex >= minPageIndex)
+    //    treats as match-all).
+    //  - Page-aligned: a non-aligned target would silently truncate a half-page on disk
+    //    via AsyncFile.shrink while keeping the whole page cached, yielding a torn read on
+    //    the next reload.
+    //  - No int overflow: targetBytes / pageSize beyond Integer.MAX_VALUE would wrap the
+    //    (int) cast to a negative minPageIndex with the same match-all consequence above.
+    if (targetBytes < 0) {
+      throw new IllegalArgumentException(
+          "Target shrink size must be non-negative: " + targetBytes);
+    }
+    final var pageSizeLocal = (long) pageSize;
+    if (targetBytes % pageSizeLocal != 0) {
+      throw new IllegalArgumentException(
+          "targetBytes must be a multiple of pageSize: targetBytes="
+              + targetBytes
+              + " pageSize="
+              + pageSizeLocal);
+    }
+    if (targetBytes / pageSizeLocal > Integer.MAX_VALUE) {
+      throw new IllegalArgumentException(
+          "minPageIndex would overflow int: targetBytes="
+              + targetBytes
+              + " pageSize="
+              + pageSizeLocal);
+    }
+    final var intId = extractFileId(fileId);
+    fileId = composeFileId(id, intId);
+
+    filesLock.acquireWriteLock();
+    try {
+      checkForClose();
+
+      final var entry = files.acquire(fileId);
+      // shrinkFile is only invoked by the recovery-time orphan-truncation orchestrator,
+      // which iterates already-open components. A null entry here means the orchestrator
+      // dispatched against a fileId that is no longer open — a contract violation worth
+      // signalling loudly rather than silently no-op'ing. The orchestrator (in
+      // AbstractStorage.truncateOrphansAfterRecovery) wraps each dispatch in a try/catch
+      // that absorbs StorageException with a WARN log so a single corrupted component
+      // does not poison recovery for the rest of the storage.
+      if (entry == null) {
+        throw new StorageException(
+            storageName,
+            "shrinkFile invoked on fileId="
+                + intId
+                + " but no file entry is open — recovery orchestrator must guarantee the"
+                + " file is open before dispatching orphan truncation");
+      }
+      try {
+        final var file = entry.get();
+        // Pre-flight no-op: a target greater than or equal to the current
+        // AsyncFile.getFileSize() has nothing to drop. The read of getFileSize() is
+        // serialised against concurrent allocateSpace / shrink writers by the surrounding
+        // filesLock writeLock + the AsyncFile internal exclusiveLock, so this snapshot is
+        // stable for the duration of the call.
+        if (file.getFileSize() <= targetBytes) {
+          // Pre-flight no-op: nothing was truncated. Returning false here (versus true on
+          // the real-truncate fall-through below) is derived from this same getFileSize()
+          // snapshot held under filesLock.writeLock, so the read-cache orchestrator can
+          // skip its purge without reopening a TOCTOU window on a recomputed size compare.
+          return false;
+        }
+        // Drop write-back layer entries at pageIndex >= minPageIndex BEFORE
+        // truncating the AsyncFile. If we truncated first, a concurrent periodic
+        // flush could write a dirty orphan entry back to disk and re-extend the
+        // file past targetBytes. Dirty entries below minPageIndex are preserved
+        // (they belong to file regions the truncate does NOT drop and need to
+        // survive the next periodic flush).
+        final var minPageIndex = (int) (targetBytes / pageSizeLocal);
+        removeCachedPages(intId, minPageIndex);
+        file.shrink(targetBytes);
+        // Boolean/physical-truncate contract: the true return below is the sole signal
+        // LockFreeReadCache.shrinkFile uses to gate its read-cache purge. Pin that the
+        // file actually reached targetBytes so a future refactor that reorders the return
+        // relative to file.shrink (or inserts an early return between removeCachedPages and
+        // the truncate) cannot silently desync the boolean from the physical state. -ea-only,
+        // zero production cost; coverage-gate.py excludes assert lines.
+        assert file.getFileSize() == targetBytes
+            : "shrinkFile returned true but physical size "
+                + file.getFileSize()
+                + " != target "
+                + targetBytes
+                + " (boolean/truncate desync breaks the read-cache purge gate)";
+        // The file was physically shrunk: signal the read-cache orchestrator to run its
+        // range-scoped purge of cached entries at pageIndex >= minPageIndex.
+        return true;
+      } finally {
+        files.release(entry);
+      }
+    } catch (final java.lang.InterruptedException e) {
+      throw BaseException.wrapException(
+          new StorageException(storageName, "File shrink was interrupted"),
+          e, storageName);
+    } finally {
+      filesLock.releaseWriteLock();
+    }
+  }
+
+  @Override
+  public boolean fileIdsAreEqual(final long firsId, final long secondId) {
+    final var firstIntId = extractFileId(firsId);
+    final var secondIntId = extractFileId(secondId);
+
+    return firstIntId == secondIntId;
+  }
+
+  @Override
+  public void renameFile(long fileId, final String newFileName) throws IOException {
+    final var intId = extractFileId(fileId);
+    fileId = composeFileId(id, intId);
+
+    filesLock.acquireWriteLock();
+    try {
+      checkForClose();
+
+      final var entry = files.acquire(fileId);
+
+      if (entry == null) {
+        return;
+      }
+
+      final String oldOsFileName;
+      final var newOsFileName = createInternalFileName(newFileName, intId);
+
+      try {
+        final var file = entry.get();
+        oldOsFileName = file.getName();
+
+        final var newFile = storagePath.resolve(newOsFileName);
+        file.renameTo(newFile);
+      } finally {
+        files.release(entry);
+      }
+
+      final var oldFileName = idNameMap.get(intId);
+
+      nameIdMap.remove(oldFileName);
+      nameIdMap.put(newFileName, intId);
+
+      idNameMap.put(intId, newFileName);
+
+      writeNameIdEntry(new NameFileIdEntry(oldFileName, -1, oldOsFileName), false);
+      writeNameIdEntry(new NameFileIdEntry(newFileName, intId, newOsFileName), true);
+    } catch (final java.lang.InterruptedException e) {
+      throw BaseException.wrapException(
+          new StorageException(storageName, "Rename of file was interrupted"),
+          e, storageName);
+    } finally {
+      filesLock.releaseWriteLock();
+    }
+  }
+
+  @Override
+  public void replaceFileId(final long fileId, final long newFileId) throws IOException {
+    filesLock.acquireWriteLock();
+    try {
+      checkForClose();
+
+      final var file = files.remove(fileId);
+      final var newFile = files.remove(newFileId);
+
+      final var intFileId = extractFileId(fileId);
+      final var newIntFileId = extractFileId(newFileId);
+
+      final var fileName = idNameMap.get(intFileId);
+      final var newFileName = idNameMap.remove(newIntFileId);
+
+      if (!file.isOpen()) {
+        file.open();
+      }
+      if (!newFile.isOpen()) {
+        newFile.open();
+      }
+
+      // invalidate old entries
+      writeNameIdEntry(new NameFileIdEntry(fileName, 0, ""), false);
+      writeNameIdEntry(new NameFileIdEntry(newFileName, 0, ""), false);
+
+      // add new one
+      writeNameIdEntry(new NameFileIdEntry(newFileName, intFileId, file.getName()), true);
+
+      file.delete();
+
+      files.add(fileId, newFile);
+
+      idNameMap.put(intFileId, newFileName);
+      nameIdMap.remove(fileName);
+      nameIdMap.put(newFileName, intFileId);
+
+      // Remove the replaced file's internal ID from non-durable registry if present.
+      // The newFile replaces the old file under intFileId, so newIntFileId is no longer
+      // valid. The intFileId retains whatever durability status the original had.
+      if (nonDurableFileIds.contains(newIntFileId)) {
+        final var updated = new IntOpenHashSet(nonDurableFileIds);
+        updated.remove(newIntFileId);
+        nonDurableFileIds = updated;
+        writeNonDurableRegistry();
+      }
+    } catch (final java.lang.InterruptedException e) {
+      throw BaseException.wrapException(
+          new StorageException(storageName, "Replace of file was interrupted"),
+          e, storageName);
+    } finally {
+      filesLock.releaseWriteLock();
+    }
+  }
+
+  private void stopFlush() {
+    stopFlush = true;
+
+    // Capture the current scheduled future. The periodic flush task checks
+    // stopFlush at the start, between flush phases, and before re-scheduling,
+    // so it will exit promptly once we set the flag.
+    final var future = flushFuture;
+
+    for (final var completionLatch : triggeredTasks.values()) {
+      try {
+        if (!completionLatch.await(shutdownTimeout, TimeUnit.MILLISECONDS)) {
+          throw new WriteCacheException(storageName,
+              "Can not shutdown data flush for storage " + storageName);
+        }
+      } catch (final java.lang.InterruptedException e) {
+        throw BaseException.wrapException(
+            new WriteCacheException(storageName,
+                "Flush of the data for storage " + storageName + " has been interrupted"),
+            e, storageName);
+      }
+    }
+
+    if (future != null) {
+      // Wait for the periodic flush to complete. We must NOT call cancel(false)
+      // before get(): FutureTask's state remains NEW while the callable is
+      // executing, so cancel(false) would transition it to CANCELLED even though
+      // the task is still running. get() on a CANCELLED future throws
+      // CancellationException immediately without waiting for the task to finish,
+      // causing a race where acquired direct memory buffers have not yet been
+      // released when the shutdown leak detector runs.
+      //
+      // Instead we rely on the stopFlush flag: the periodic flush checks it at
+      // the start, between flush phases, and in the finally block (skipping
+      // re-schedule). If the task hasn't started, it will start and exit
+      // immediately. If it's mid-flush, it will finish the current phase and
+      // exit at the next checkpoint. get() waits for this to complete.
+      try {
+        future.get(shutdownTimeout, TimeUnit.MILLISECONDS);
+      } catch (final java.lang.InterruptedException e) {
+        Thread.currentThread().interrupt();
+      } catch (final CancellationException e) {
+        // The future may have been cancelled by a concurrent close() call;
+        // in that case the task either never started or already completed.
+      } catch (final ExecutionException e) {
+        throw BaseException.wrapException(
+            new WriteCacheException(storageName,
+                "Error in execution of data flush for storage " + storageName),
+            e, storageName);
+      } catch (final TimeoutException e) {
+        throw BaseException.wrapException(
+            new WriteCacheException(storageName,
+                "Can not shutdown data flush for storage " + storageName),
+            e, storageName);
+      }
+    }
+  }
+
+  @Override
+  public long[] close() throws IOException {
+    flush();
+    stopFlush();
+
+    filesLock.acquireWriteLock();
+    try {
+      if (closed) {
+        return new long[0];
+      }
+
+      closed = true;
+
+      final var fileIds = nameIdMap.values();
+
+      final var closedIds = new LongArrayList(1_000);
+      final var idFileNameMap = new Int2ObjectOpenHashMap<String>(1_000);
+
+      for (final var intId : fileIds) {
+        if (intId >= 0) {
+          final var extId = composeFileId(id, intId);
+          final var fileClassic = files.remove(extId);
+
+          idFileNameMap.put(intId.intValue(), fileClassic.getName());
+          fileClassic.close();
+          closedIds.add(extId);
+        }
+      }
+
+      final var nameIdMapBackupPath = storagePath.resolve(NAME_ID_MAP_V2_BACKUP);
+      try (final var nameIdMapHolder =
+          FileChannel.open(
+              nameIdMapBackupPath,
+              StandardOpenOption.CREATE,
+              StandardOpenOption.READ,
+              StandardOpenOption.WRITE)) {
+        nameIdMapHolder.truncate(0);
+
+        for (final var entry : nameIdMap.entrySet()) {
+          final String fileName;
+
+          if (entry.getValue() >= 0) {
+            fileName = idFileNameMap.get(entry.getValue().intValue());
+          } else {
+            fileName = entry.getKey();
+          }
+
+          writeNameIdEntry(
+              nameIdMapHolder,
+              new NameFileIdEntry(entry.getKey(), entry.getValue(), fileName),
+              false);
+        }
+
+        nameIdMapHolder.force(true);
+      }
+
+      try {
+        Files.move(
+            nameIdMapBackupPath,
+            nameIdMapHolderPath,
+            StandardCopyOption.REPLACE_EXISTING,
+            StandardCopyOption.ATOMIC_MOVE);
+      } catch (AtomicMoveNotSupportedException e) {
+        Files.move(nameIdMapBackupPath, nameIdMapHolderPath, StandardCopyOption.REPLACE_EXISTING);
+      }
+
+      doubleWriteLog.close();
+
+      // Non-durable side files are intentionally preserved on clean shutdown so that
+      // crash recovery can identify and delete non-durable files if the next startup
+      // follows a crash. On clean open, initNameIdMapping() reads the side files to
+      // restore the nonDurableFileIds set; on crash recovery, recoverIfNeeded() calls
+      // deleteNonDurableFilesOnRecovery() which reads the same set and deletes the files.
+      //
+      // Best-effort final persist of non-durable state. Every mutation already writes
+      // the registry, so this is redundant in the normal case. If it fails, the side
+      // files still reflect the state from the last successful mutation write.
+      try {
+        writeNonDurableRegistry();
+      } catch (final IOException e) {
+        logger.warn("Failed to write non-durable registry during close", e);
+      }
+
+      nameIdMap.clear();
+      idNameMap.clear();
+      nonDurableFileIds = new IntOpenHashSet();
+
+      return closedIds.toLongArray();
+    } finally {
+      filesLock.releaseWriteLock();
+    }
+  }
+
+  private void checkForClose() {
+    if (closed) {
+      throw new StorageException(storageName, "Write cache is closed and can not be used");
+    }
+  }
+
+  @Override
+  public void close(long fileId, final boolean flush) {
+    final var intId = extractFileId(fileId);
+    fileId = composeFileId(id, intId);
+
+    filesLock.acquireWriteLock();
+    try {
+      checkForClose();
+
+      if (flush) {
+        flush(intId);
+      } else {
+        removeCachedPages(intId);
+      }
+
+      if (!files.close(fileId)) {
+        throw new StorageException(storageName,
+            "Can not close file with id " + internalFileId(fileId) + " because it is still in use");
+      }
+    } finally {
+      filesLock.releaseWriteLock();
+    }
+  }
+
+  @Nullable @Override
+  public String restoreFileById(final long fileId) throws IOException {
+    final var intId = extractFileId(fileId);
+    filesLock.acquireWriteLock();
+    try {
+      checkForClose();
+
+      for (final var entry : nameIdMap.entrySet()) {
+        if (entry.getValue() == -intId) {
+          addFile(entry.getKey(), fileId);
+          return entry.getKey();
+        }
+      }
+    } finally {
+      filesLock.releaseWriteLock();
+    }
+
+    return null;
+  }
+
+  @Override
+  public PageDataVerificationError[] checkStoredPages(
+      final CommandOutputListener commandOutputListener) {
+    final var notificationTimeOut = 5000;
+
+    final List<PageDataVerificationError> errors = new ArrayList<>(0);
+
+    filesLock.acquireWriteLock();
+    try {
+      checkForClose();
+
+      for (final var intId : nameIdMap.values()) {
+        if (intId < 0) {
+          continue;
+        }
+
+        checkFileStoredPages(commandOutputListener, notificationTimeOut, errors, intId);
+      }
+
+      return errors.toArray(new PageDataVerificationError[0]);
+    } catch (final java.lang.InterruptedException e) {
+      throw BaseException.wrapException(new StorageException(storageName, "Thread was interrupted"),
+          e, storageName);
+    } finally {
+      filesLock.releaseWriteLock();
+    }
+  }
+
+  private void checkFileStoredPages(
+      final CommandOutputListener commandOutputListener,
+      @SuppressWarnings("SameParameterValue") final int notificationTimeOut,
+      final List<PageDataVerificationError> errors,
+      final Integer intId)
+      throws java.lang.InterruptedException {
+    boolean fileIsCorrect;
+    final var externalId = composeFileId(id, intId);
+    final var entry = files.acquire(externalId);
+    final var fileClassic = entry.get();
+    final var fileName = idNameMap.get(intId);
+
+    try {
+      if (commandOutputListener != null) {
+        commandOutputListener.onMessage("Flashing file " + fileName + "... ");
+      }
+
+      flush(intId);
+
+      if (commandOutputListener != null) {
+        commandOutputListener.onMessage(
+            "Start verification of content of " + fileName + "file ...\n");
+      }
+
+      var time = System.currentTimeMillis();
+
+      final var filledUpTo = fileClassic.getFileSize();
+      fileIsCorrect = true;
+
+      for (long pos = 0; pos < filledUpTo; pos += pageSize) {
+        var checkSumIncorrect = false;
+        var magicNumberIncorrect = false;
+
+        final var data = new byte[pageSize];
+
+        final var pointer = bufferPool.acquireDirect(true, Intention.CHECK_FILE_STORAGE);
+        try {
+          final var byteBuffer = pointer.getNativeByteBuffer();
+          fileClassic.read(pos, byteBuffer, true);
+          byteBuffer.rewind();
+          byteBuffer.get(data);
+        } finally {
+          bufferPool.release(pointer);
+        }
+
+        final var magicNumber =
+            LongSerializer.deserializeNative(data, MAGIC_NUMBER_OFFSET);
+
+        if (magicNumber != MAGIC_NUMBER_WITH_CHECKSUM
+            && magicNumber != MAGIC_NUMBER_WITHOUT_CHECKSUM
+            && magicNumber != MAGIC_NUMBER_WITH_CHECKSUM_ENCRYPTED
+            && magicNumber != MAGIC_NUMBER_WITHOUT_CHECKSUM_ENCRYPTED) {
+          magicNumberIncorrect = true;
+          if (commandOutputListener != null) {
+            commandOutputListener.onMessage(
+                "Error: Magic number for page "
+                    + (pos / pageSize)
+                    + " in file '"
+                    + fileName
+                    + "' does not match!\n");
+          }
+          fileIsCorrect = false;
+        }
+
+        if (magicNumber != MAGIC_NUMBER_WITHOUT_CHECKSUM) {
+          final var storedCRC32 =
+              IntegerSerializer.deserializeNative(data, CHECKSUM_OFFSET);
+
+          final var crc32 = new CRC32();
+          crc32.update(
+              data, PAGE_OFFSET_TO_CHECKSUM_FROM, data.length - PAGE_OFFSET_TO_CHECKSUM_FROM);
+          final var calculatedCRC32 = (int) crc32.getValue();
+
+          if (storedCRC32 != calculatedCRC32) {
+            checkSumIncorrect = true;
+            if (commandOutputListener != null) {
+              commandOutputListener.onMessage(
+                  "Error: Checksum for page "
+                      + (pos / pageSize)
+                      + " in file '"
+                      + fileName
+                      + "' is incorrect!\n");
+            }
+            fileIsCorrect = false;
+          }
+        }
+
+        if (magicNumberIncorrect || checkSumIncorrect) {
+          errors.add(
+              new PageDataVerificationError(
+                  magicNumberIncorrect, checkSumIncorrect, pos / pageSize, fileName));
+        }
+
+        if (commandOutputListener != null
+            && System.currentTimeMillis() - time > notificationTimeOut) {
+          time = notificationTimeOut;
+          commandOutputListener.onMessage((pos / pageSize) + " pages were processed...\n");
+        }
+      }
+    } catch (final IOException ioe) {
+      if (commandOutputListener != null) {
+        commandOutputListener.onMessage(
+            "Error: Error during processing of file '"
+                + fileName
+                + "'. "
+                + ioe.getMessage()
+                + "\n");
+      }
+
+      fileIsCorrect = false;
+    } finally {
+      files.release(entry);
+    }
+
+    if (!fileIsCorrect) {
+      if (commandOutputListener != null) {
+        commandOutputListener.onMessage(
+            "Verification of file '" + fileName + "' is finished with errors.\n");
+      }
+    } else {
+      if (commandOutputListener != null) {
+        commandOutputListener.onMessage(
+            "Verification of file '" + fileName + "' is successfully finished.\n");
+      }
+    }
+  }
+
+  @Override
+  public long[] delete() throws IOException {
+    // Stop the periodic flush FIRST so the single-threaded commitExecutor is free
+    // for DeleteFileTask submissions below. Without this, delete() can deadlock:
+    // the main thread holds filesLock write lock and blocks on future.get(), while
+    // a PeriodicFlushTask occupying the same single-threaded executor cannot
+    // complete (e.g., stuck in writePageChunksToFiles retry loop or waiting on a
+    // resource held by the main thread).
+    stopFlush();
+
+    final var result = new LongArrayList(1_024);
+    filesLock.acquireWriteLock();
+    try {
+      checkForClose();
+
+      for (final int internalFileId : nameIdMap.values()) {
+        if (internalFileId < 0) {
+          continue;
+        }
+
+        final var externalId = composeFileId(id, internalFileId);
+
+        final RawPair<String, String> file;
+        final var future =
+            commitExecutor().submit(new DeleteFileTask(this, externalId));
+        try {
+          file = future.get();
+        } catch (final java.lang.InterruptedException e) {
+          throw BaseException.wrapException(
+              new ThreadInterruptedException("File data removal was interrupted"), e, storageName);
+        } catch (final Exception e) {
+          throw BaseException.wrapException(
+              new WriteCacheException(storageName, "File data removal was abnormally terminated"),
+              e, storageName);
+        }
+
+        if (file != null) {
+          result.add(externalId);
+        }
+      }
+
+      if (nameIdMapHolderPath != null) {
+        if (Files.exists(nameIdMapHolderPath)) {
+          Files.delete(nameIdMapHolderPath);
+        }
+
+        nameIdMapHolderPath = null;
+      }
+
+      // Delete non-durable side files alongside name-id map deletion
+      Files.deleteIfExists(storagePath.resolve(NON_DURABLE_FILES));
+      Files.deleteIfExists(storagePath.resolve(NON_DURABLE_FILES_SHADOW));
+      nonDurableFileIds = new IntOpenHashSet();
+    } finally {
+      filesLock.releaseWriteLock();
+    }
+
+    doubleWriteLog.close();
+
+    return result.toLongArray();
+  }
+
+  @Override
+  public String fileNameById(final long fileId) {
+    final var intId = extractFileId(fileId);
+
+    return idNameMap.get(intId);
+  }
+
+  @Nullable @Override
+  public String nativeFileNameById(final long fileId) {
+    final var fileClassic = files.get(fileId);
+    if (fileClassic != null) {
+      return fileClassic.getName();
+    }
+
+    return null;
+  }
+
+  @Override
+  public int getId() {
+    return id;
+  }
+
+  private static void openFile(String storageName, final File fileClassic) {
+    if (fileClassic.exists()) {
+      if (!fileClassic.isOpen()) {
+        fileClassic.open();
+      }
+    } else {
+      throw new StorageException(storageName, "File " + fileClassic + " does not exist.");
+    }
+  }
+
+  private static void createFile(final File fileClassic, final boolean callFsync)
+      throws IOException {
+    if (!fileClassic.exists()) {
+      fileClassic.create();
+    } else {
+      if (!fileClassic.isOpen()) {
+        fileClassic.open();
+      }
+      fileClassic.shrink(0);
+    }
+
+    if (callFsync) {
+      fileClassic.synch();
+    }
+  }
+
+  private void initNameIdMapping() throws IOException, java.lang.InterruptedException {
+    if (!Files.exists(storagePath)) {
+      Files.createDirectories(storagePath);
+    }
+
+    final var nameIdMapHolderV1 = storagePath.resolve(NAME_ID_MAP_V1);
+    final var nameIdMapHolderV2 = storagePath.resolve(NAME_ID_MAP_V2);
+    final var nameIdMapHolderV3 = storagePath.resolve(NAME_ID_MAP_V3);
+
+    if (Files.exists(nameIdMapHolderV1)) {
+      if (Files.exists(nameIdMapHolderV2)) {
+        Files.delete(nameIdMapHolderV2);
+      }
+      if (Files.exists(nameIdMapHolderV3)) {
+        Files.delete(nameIdMapHolderV3);
+      }
+
+      try (final var nameIdMapHolder =
+          FileChannel.open(nameIdMapHolderV1, StandardOpenOption.WRITE, StandardOpenOption.READ)) {
+        readNameIdMapV1(nameIdMapHolder);
+      }
+
+      Files.delete(nameIdMapHolderV1);
+    } else if (Files.exists(nameIdMapHolderV2)) {
+      if (Files.exists(nameIdMapHolderV3)) {
+        Files.delete(nameIdMapHolderV3);
+      }
+
+      try (final var nameIdMapHolder =
+          FileChannel.open(nameIdMapHolderV2, StandardOpenOption.WRITE, StandardOpenOption.READ)) {
+        readNameIdMapV2(nameIdMapHolder);
+      }
+
+      Files.delete(nameIdMapHolderV2);
+    }
+
+    nameIdMapHolderPath = nameIdMapHolderV3;
+    if (Files.exists(nameIdMapHolderPath)) {
+      try (final var nameIdMapHolder =
+          FileChannel.open(
+              nameIdMapHolderPath, StandardOpenOption.WRITE, StandardOpenOption.READ)) {
+        readNameIdMapV3(nameIdMapHolder);
+      }
+    } else {
+      storedNameIdMapToV3();
+    }
+
+    // Load non-durable file IDs after all name-id map migrations are complete, so we can
+    // filter out IDs that no longer exist in idNameMap.
+    nonDurableFileIds = readNonDurableRegistry();
+  }
+
+  private void storedNameIdMapToV3() throws IOException {
+    final var nameIdMapHolderFileV3T = storagePath.resolve(NAME_ID_MAP_V3_T);
+
+    if (Files.exists(nameIdMapHolderFileV3T)) {
+      Files.delete(nameIdMapHolderFileV3T);
+    }
+
+    final var v3NameIdMapHolder =
+        FileChannel.open(
+            nameIdMapHolderFileV3T,
+            StandardOpenOption.CREATE,
+            StandardOpenOption.WRITE,
+            StandardOpenOption.READ);
+
+    for (final var nameIdEntry : nameIdMap.entrySet()) {
+      if (nameIdEntry.getValue() >= 0) {
+        final var fileClassic = files.get(externalFileId(nameIdEntry.getValue()));
+        final var fileSystemName = fileClassic.getName();
+
+        final var nameFileIdEntry =
+            new NameFileIdEntry(nameIdEntry.getKey(), nameIdEntry.getValue(), fileSystemName);
+        writeNameIdEntry(v3NameIdMapHolder, nameFileIdEntry, false);
+      } else {
+        final var nameFileIdEntry =
+            new NameFileIdEntry(nameIdEntry.getKey(), nameIdEntry.getValue(), "");
+        writeNameIdEntry(v3NameIdMapHolder, nameFileIdEntry, false);
+      }
+    }
+
+    v3NameIdMapHolder.force(true);
+    v3NameIdMapHolder.close();
+
+    try {
+      Files.move(
+          nameIdMapHolderFileV3T,
+          storagePath.resolve(NAME_ID_MAP_V3),
+          StandardCopyOption.ATOMIC_MOVE);
+    } catch (AtomicMoveNotSupportedException e) {
+      Files.move(nameIdMapHolderFileV3T, storagePath.resolve(NAME_ID_MAP_V3));
+    }
+  }
+
+  /**
+   * Writes the current set of non-durable file IDs to the shadow-copy side file pair.
+   * Write protocol: write shadow → fsync → write primary → fsync.
+   *
+   * <p>Format: {@code [4 bytes version][8 bytes xxHash64][4 bytes count][count × 4 bytes fileId]}
+   *
+   * <p>Must be called under {@link #filesLock} write lock.
+   */
+  private void writeNonDurableRegistry() throws IOException {
+    final var currentSet = nonDurableFileIds;
+    if (currentSet.isEmpty()) {
+      // No non-durable files — delete both side files if they exist.
+      // Delete shadow first, then primary: a crash between the two deletions leaves
+      // the primary (which is read first on recovery) as the authoritative source.
+      Files.deleteIfExists(storagePath.resolve(NON_DURABLE_FILES_SHADOW));
+      Files.deleteIfExists(storagePath.resolve(NON_DURABLE_FILES));
+      return;
+    }
+
+    final var count = currentSet.size();
+    // version(4) + xxHash(8) + count(4) + count*fileId(4)
+    final var buffer = ByteBuffer.allocate(4 + 8 + 4 + count * 4);
+    buffer.order(ByteOrder.BIG_ENDIAN);
+
+    // Write version first
+    buffer.putInt(NON_DURABLE_FILES_VERSION);
+
+    // Reserve space for xxHash (will be written after content)
+    final var hashPosition = buffer.position();
+    assert hashPosition == 4
+        : "hashPosition must be 4 (one version int written); got " + hashPosition;
+    buffer.position(hashPosition + 8);
+
+    // Write count and file IDs
+    buffer.putInt(count);
+    for (final var intIterator = currentSet.iterator(); intIterator.hasNext();) {
+      buffer.putInt(intIterator.nextInt());
+    }
+
+    assert buffer.position() == buffer.capacity()
+        : "Buffer not fully written: position=" + buffer.position()
+            + " capacity=" + buffer.capacity();
+
+    // Compute xxHash over the content after the hash field (from count onward)
+    final var contentStart = hashPosition + 8;
+    final var xxHash =
+        XX_HASH_64.hash(buffer, contentStart, buffer.capacity() - contentStart, XX_HASH_SEED);
+    buffer.putLong(hashPosition, xxHash);
+
+    buffer.rewind();
+
+    // Write shadow first, then primary
+    final var shadowPath = storagePath.resolve(NON_DURABLE_FILES_SHADOW);
+    try (final var channel =
+        FileChannel.open(
+            shadowPath,
+            StandardOpenOption.CREATE,
+            StandardOpenOption.WRITE,
+            StandardOpenOption.TRUNCATE_EXISTING)) {
+      IOUtils.writeByteBuffer(buffer, channel, 0);
+      if (callFsync) {
+        channel.force(true);
+      }
+    }
+
+    buffer.rewind();
+
+    final var primaryPath = storagePath.resolve(NON_DURABLE_FILES);
+    try (final var channel =
+        FileChannel.open(
+            primaryPath,
+            StandardOpenOption.CREATE,
+            StandardOpenOption.WRITE,
+            StandardOpenOption.TRUNCATE_EXISTING)) {
+      IOUtils.writeByteBuffer(buffer, channel, 0);
+      if (callFsync) {
+        channel.force(true);
+      }
+    }
+  }
+
+  /**
+   * Reads non-durable file IDs from the shadow-copy side file pair.
+   * Read protocol: try primary, if hash invalid → try shadow, if both invalid → return empty.
+   * Filters out IDs not present in {@link #idNameMap}.
+   *
+   * <p>Must be called under {@link #filesLock} write lock, after name-id map is fully loaded.
+   */
+  private IntOpenHashSet readNonDurableRegistry() {
+    final var primaryPath = storagePath.resolve(NON_DURABLE_FILES);
+    final var shadowPath = storagePath.resolve(NON_DURABLE_FILES_SHADOW);
+
+    var result = readNonDurableRegistryFile(primaryPath);
+    if (result != null) {
+      return result;
+    }
+
+    result = readNonDurableRegistryFile(shadowPath);
+    if (result != null) {
+      return result;
+    }
+
+    // Both missing or corrupt — safe fallback: treat all files as durable
+    return new IntOpenHashSet();
+  }
+
+  /**
+   * Attempts to read non-durable file IDs from a single side file. Returns null if the file
+   * does not exist, is too small, or has an invalid xxHash.
+   */
+  private IntOpenHashSet readNonDurableRegistryFile(final Path path) {
+    if (!Files.exists(path)) {
+      return null;
+    }
+
+    try (final var channel =
+        FileChannel.open(path, StandardOpenOption.READ)) {
+      final var size = channel.size();
+
+      // Minimum valid size: version(4) + hash(8) + count(4) = 16 bytes
+      if (size < 16) {
+        logger.warn("Non-durable registry file {} is too small ({}), ignoring", path, size);
+        return null;
+      }
+
+      // Sanity check: side file should never be larger than a few KB
+      if (size > MAX_FILE_RECORD_LEN) {
+        logger.warn("Non-durable registry file {} is too large ({}), ignoring", path, size);
+        return null;
+      }
+
+      final var buffer = ByteBuffer.allocate((int) size);
+      buffer.order(ByteOrder.BIG_ENDIAN);
+      IOUtils.readByteBuffer(buffer, channel);
+      buffer.rewind();
+
+      final var version = buffer.getInt();
+      if (version != NON_DURABLE_FILES_VERSION) {
+        logger.warn(
+            "Non-durable registry file {} has unsupported version {}, ignoring",
+            path, version);
+        return null;
+      }
+
+      final var storedHash = buffer.getLong();
+
+      // Verify xxHash over content after the hash field
+      final var contentStart = 4 + 8; // version + hash
+      final var xxHash =
+          XX_HASH_64.hash(buffer, contentStart, buffer.capacity() - contentStart, XX_HASH_SEED);
+      if (xxHash != storedHash) {
+        logger.warn("Non-durable registry file {} has invalid checksum, ignoring", path);
+        return null;
+      }
+
+      final var count = buffer.getInt();
+      if (count < 0 || count > (size - contentStart - 4) / 4) {
+        logger.warn(
+            "Non-durable registry file {} has invalid count {}, ignoring", path, count);
+        return null;
+      }
+
+      final var result = new IntOpenHashSet(count);
+      for (var i = 0; i < count; i++) {
+        final var fileId = buffer.getInt();
+        // Only keep IDs that still exist in the name-id map (filter stale entries)
+        if (idNameMap.containsKey(fileId)) {
+          result.add(fileId);
+        }
+      }
+
+      return result;
+    } catch (final IOException e) {
+      logger.warn("Failed to read non-durable registry file {}", path, e);
+      return null;
+    }
+  }
+
+  private File createFileInstance(final String fileName, final int fileId) {
+    final var internalFileName = createInternalFileName(fileName, fileId);
+    return new AsyncFile(
+        storagePath.resolve(internalFileName),
+        pageSize,
+        logFileDeletion,
+        this.executor,
+        storageName);
+  }
+
+  private static String createInternalFileName(final String fileName, final int fileId) {
+    final var extSeparator = fileName.lastIndexOf('.');
+
+    String prefix;
+    if (extSeparator < 0) {
+      prefix = fileName;
+    } else if (extSeparator == 0) {
+      prefix = "";
+    } else {
+      prefix = fileName.substring(0, extSeparator);
+    }
+
+    final String suffix;
+    if (extSeparator < 0 || extSeparator == fileName.length() - 1) {
+      suffix = "";
+    } else {
+      suffix = fileName.substring(extSeparator + 1);
+    }
+
+    prefix = prefix + "_" + fileId;
+
+    if (extSeparator >= 0) {
+      return prefix + "." + suffix;
+    }
+
+    return prefix;
+  }
+
+  /**
+   * Read information about files are registered inside of write cache/storage File consist of rows
+   * of variable length which contains following entries:
+   *
+   * <ol>
+   *   <li>XX_HASH code of the content of the row excluding first two entries.
+   *   <li>Length of the content of the row excluding of two entries above.
+   *   <li>Internal file id, may be positive or negative depends on whether file is removed or not
+   *   <li>Name of file inside of write cache, this name is case sensitive
+   *   <li>Name of file which is used inside file system it can be different from name of file used
+   *       inside write cache
+   * </ol>
+   */
+  private void readNameIdMapV3(FileChannel nameIdMapHolder)
+      throws IOException, java.lang.InterruptedException {
+    nameIdMap.clear();
+
+    long localFileCounter = -1;
+
+    nameIdMapHolder.position(0);
+
+    NameFileIdEntry nameFileIdEntry;
+
+    final var idFileNameMap = new Int2ObjectOpenHashMap<String>(1_000);
+
+    while ((nameFileIdEntry = readNextNameIdEntryV3(nameIdMapHolder)) != null) {
+      final long absFileId = Math.abs(nameFileIdEntry.getFileId());
+
+      if (localFileCounter < absFileId) {
+        localFileCounter = absFileId;
+      }
+
+      if (absFileId != 0) {
+        nameIdMap.put(nameFileIdEntry.getName(), nameFileIdEntry.getFileId());
+        idNameMap.put(nameFileIdEntry.getFileId(), nameFileIdEntry.getName());
+
+        idFileNameMap.put(nameFileIdEntry.getFileId(), nameFileIdEntry.getFileSystemName());
+      } else {
+        nameIdMap.remove(nameFileIdEntry.getName());
+        idNameMap.remove(nameFileIdEntry.getFileId());
+        idFileNameMap.remove(nameFileIdEntry.getFileId());
+      }
+    }
+
+    for (final var nameIdEntry : nameIdMap.entrySet()) {
+      final int fileId = nameIdEntry.getValue();
+
+      if (fileId >= 0) {
+        final var externalId = composeFileId(id, nameIdEntry.getValue());
+
+        if (files.get(externalId) == null) {
+          final var path =
+              storagePath.resolve(idFileNameMap.get(nameIdEntry.getValue().intValue()));
+          final var file =
+              new AsyncFile(path, pageSize, logFileDeletion, this.executor, storageName);
+
+          if (file.exists()) {
+            file.open();
+            files.add(externalId, file);
+          } else {
+            idNameMap.remove(fileId);
+
+            nameIdMap.put(nameIdEntry.getKey(), -fileId);
+            idNameMap.put(-fileId, nameIdEntry.getKey());
+          }
+        }
+      }
+    }
+  }
+
+  /**
+   * Read information about files are registered inside of write cache/storage File consist of rows
+   * of variable length which contains following entries:
+   *
+   * <ol>
+   *   <li>Internal file id, may be positive or negative depends on whether file is removed or not
+   *   <li>Name of file inside of write cache, this name is case sensitive
+   *   <li>Name of file which is used inside file system it can be different from name of file used
+   *       inside write cache
+   * </ol>
+   */
+  private void readNameIdMapV2(FileChannel nameIdMapHolder)
+      throws IOException, java.lang.InterruptedException {
+    nameIdMap.clear();
+
+    long localFileCounter = -1;
+
+    nameIdMapHolder.position(0);
+
+    NameFileIdEntry nameFileIdEntry;
+
+    final var idFileNameMap = new Int2ObjectOpenHashMap<String>(1_000);
+
+    while ((nameFileIdEntry = readNextNameIdEntryV2(nameIdMapHolder)) != null) {
+      final long absFileId = Math.abs(nameFileIdEntry.getFileId());
+
+      if (localFileCounter < absFileId) {
+        localFileCounter = absFileId;
+      }
+
+      if (absFileId != 0) {
+        nameIdMap.put(nameFileIdEntry.getName(), nameFileIdEntry.getFileId());
+        idNameMap.put(nameFileIdEntry.getFileId(), nameFileIdEntry.getName());
+
+        idFileNameMap.put(nameFileIdEntry.getFileId(), nameFileIdEntry.getFileSystemName());
+      } else {
+        nameIdMap.remove(nameFileIdEntry.getName());
+        idNameMap.remove(nameFileIdEntry.getFileId());
+
+        idFileNameMap.remove(nameFileIdEntry.getFileId());
+      }
+    }
+
+    for (final var nameIdEntry : nameIdMap.entrySet()) {
+      final int fileId = nameIdEntry.getValue();
+
+      if (fileId > 0) {
+        final var externalId = composeFileId(id, nameIdEntry.getValue());
+
+        if (files.get(externalId) == null) {
+          final var path =
+              storagePath.resolve(idFileNameMap.get(nameIdEntry.getValue().intValue()));
+          final var file =
+              new AsyncFile(path, pageSize, logFileDeletion, this.executor, storageName);
+
+          if (file.exists()) {
+            file.open();
+            files.add(externalId, file);
+          } else {
+            idNameMap.remove(fileId);
+
+            nameIdMap.put(nameIdEntry.getKey(), -fileId);
+            idNameMap.put(-fileId, nameIdEntry.getKey());
+          }
+        }
+      }
+    }
+  }
+
+  private void readNameIdMapV1(final FileChannel nameIdMapHolder)
+      throws IOException, java.lang.InterruptedException {
+    // older versions of ODB incorrectly logged file deletions
+    // some deleted files have the same id
+    // because we reuse ids of removed files when we re-create them
+    // we need to fix this situation
+    final var filesWithNegativeIds =
+        new Int2ObjectOpenHashMap<Set<String>>(1_000);
+
+    nameIdMap.clear();
+
+    long localFileCounter = -1;
+
+    nameIdMapHolder.position(0);
+
+    NameFileIdEntry nameFileIdEntry;
+    while ((nameFileIdEntry = readNextNameIdEntryV1(nameIdMapHolder)) != null) {
+
+      final long absFileId = Math.abs(nameFileIdEntry.getFileId());
+      if (localFileCounter < absFileId) {
+        localFileCounter = absFileId;
+      }
+
+      final var existingId = nameIdMap.get(nameFileIdEntry.getName());
+
+      if (existingId != null && existingId < 0) {
+        final var files = filesWithNegativeIds.get(existingId.intValue());
+
+        if (files != null) {
+          files.remove(nameFileIdEntry.getName());
+          if (files.isEmpty()) {
+            filesWithNegativeIds.remove(existingId.intValue());
+          }
+        }
+      }
+
+      if (nameFileIdEntry.getFileId() < 0) {
+        var files = filesWithNegativeIds.get(nameFileIdEntry.getFileId());
+
+        if (files == null) {
+          files = new HashSet<>(8);
+          files.add(nameFileIdEntry.getName());
+          filesWithNegativeIds.put(nameFileIdEntry.getFileId(), files);
+        } else {
+          files.add(nameFileIdEntry.getName());
+        }
+      }
+
+      nameIdMap.put(nameFileIdEntry.getName(), nameFileIdEntry.getFileId());
+      idNameMap.put(nameFileIdEntry.getFileId(), nameFileIdEntry.getName());
+    }
+
+    for (final var nameIdEntry : nameIdMap.entrySet()) {
+      if (nameIdEntry.getValue() >= 0) {
+        final var externalId = composeFileId(id, nameIdEntry.getValue());
+
+        if (files.get(externalId) == null) {
+          final File fileClassic =
+              new AsyncFile(
+                  storagePath.resolve(nameIdEntry.getKey()),
+                  pageSize,
+                  logFileDeletion,
+                  this.executor,
+                  storageName);
+
+          if (fileClassic.exists()) {
+            fileClassic.open();
+            files.add(externalId, fileClassic);
+          } else {
+            final var fileId = nameIdMap.get(nameIdEntry.getKey());
+
+            if (fileId != null && fileId > 0) {
+              nameIdMap.put(nameIdEntry.getKey(), -fileId);
+
+              idNameMap.remove(fileId);
+              idNameMap.put(-fileId, nameIdEntry.getKey());
+            }
+          }
+        }
+      }
+    }
+
+    final Set<String> fixedFiles = new HashSet<>(8);
+
+    for (final var entry : filesWithNegativeIds.int2ObjectEntrySet()) {
+      final var files = entry.getValue();
+
+      if (files.size() > 1) {
+        idNameMap.remove(entry.getIntKey());
+
+        for (final var fileName : files) {
+          int fileId;
+
+          while (true) {
+            final var nextId = fileIdGen.nextInt(Integer.MAX_VALUE - 1) + 1;
+            if (!idNameMap.containsKey(nextId) && !idNameMap.containsKey(-nextId)) {
+              fileId = nextId;
+              break;
+            }
+          }
+
+          nameIdMap.put(fileName, -fileId);
+          idNameMap.put(-fileId, fileName);
+
+          fixedFiles.add(fileName);
+        }
+      }
+    }
+
+    if (!fixedFiles.isEmpty()) {
+      LogManager.instance()
+          .warn(
+              this,
+              "Removed files "
+                  + fixedFiles
+                  + " had duplicated ids. Problem is fixed automatically.");
+    }
+  }
+
+  @Nullable private static NameFileIdEntry readNextNameIdEntryV1(FileChannel nameIdMapHolder)
+      throws IOException {
+    try {
+      var buffer = ByteBuffer.allocate(IntegerSerializer.INT_SIZE);
+      IOUtils.readByteBuffer(buffer, nameIdMapHolder);
+      buffer.rewind();
+
+      final var nameSize = buffer.getInt();
+      buffer = ByteBuffer.allocate(nameSize + LongSerializer.LONG_SIZE);
+
+      IOUtils.readByteBuffer(buffer, nameIdMapHolder);
+      buffer.rewind();
+
+      final var name = StringSerializer.staticDeserializeFromByteBufferObject(buffer);
+      final var fileId = (int) buffer.getLong();
+
+      return new NameFileIdEntry(name, fileId);
+    } catch (final EOFException ignore) {
+      return null;
+    }
+  }
+
+  @Nullable private static NameFileIdEntry readNextNameIdEntryV2(FileChannel nameIdMapHolder)
+      throws IOException {
+    try {
+      var buffer = ByteBuffer.allocate(2 * IntegerSerializer.INT_SIZE);
+      IOUtils.readByteBuffer(buffer, nameIdMapHolder);
+      buffer.rewind();
+
+      final var fileId = buffer.getInt();
+      final var nameSize = buffer.getInt();
+
+      buffer = ByteBuffer.allocate(nameSize);
+
+      IOUtils.readByteBuffer(buffer, nameIdMapHolder);
+      buffer.rewind();
+
+      final var name = StringSerializer.staticDeserializeFromByteBufferObject(buffer);
+
+      buffer = ByteBuffer.allocate(IntegerSerializer.INT_SIZE);
+      IOUtils.readByteBuffer(buffer, nameIdMapHolder);
+      buffer.rewind();
+
+      final var fileNameSize = buffer.getInt();
+
+      buffer = ByteBuffer.allocate(fileNameSize);
+      IOUtils.readByteBuffer(buffer, nameIdMapHolder);
+      buffer.rewind();
+
+      final var fileName = StringSerializer.staticDeserializeFromByteBufferObject(buffer);
+
+      return new NameFileIdEntry(name, fileId, fileName);
+
+    } catch (final EOFException ignore) {
+      return null;
+    }
+  }
+
+  @Nullable private NameFileIdEntry readNextNameIdEntryV3(FileChannel nameIdMapHolder) throws IOException {
+    try {
+      final var xxHashLen = 8;
+      final var recordSizeLen = 4;
+
+      var buffer = ByteBuffer.allocate(xxHashLen + recordSizeLen);
+      IOUtils.readByteBuffer(buffer, nameIdMapHolder);
+      buffer.rewind();
+
+      final var storedXxHash = buffer.getLong();
+      final var recordLen = buffer.getInt();
+
+      if (recordLen > MAX_FILE_RECORD_LEN) {
+        LogManager.instance()
+            .error(
+                this,
+                "Maximum record length in file registry can not exceed %d bytes. "
+                    + "But actual record length %d.  Storage name : %s",
+                null,
+                MAX_FILE_RECORD_LEN,
+                storageName,
+                recordLen);
+        return null;
+      }
+
+      buffer = ByteBuffer.allocate(recordLen);
+      IOUtils.readByteBuffer(buffer, nameIdMapHolder);
+      buffer.rewind();
+
+      final var xxHash = DiskStorage.XX_HASH_64.hash(buffer, 0, recordLen,
+          DiskStorage.XX_HASH_SEED);
+      if (xxHash != storedXxHash) {
+        LogManager.instance()
+            .error(
+                this, "Hash of the file registry is broken. Storage name : %s", null, storageName);
+        return null;
+      }
+
+      final var fileId = buffer.getInt();
+      final var name = StringSerializer.staticDeserializeFromByteBufferObject(buffer);
+      final var fileName = StringSerializer.staticDeserializeFromByteBufferObject(buffer);
+
+      return new NameFileIdEntry(name, fileId, fileName);
+
+    } catch (final EOFException ignore) {
+      return null;
+    }
+  }
+
+  private void writeNameIdEntry(final NameFileIdEntry nameFileIdEntry, final boolean sync)
+      throws IOException {
+    try (final var nameIdMapHolder =
+        FileChannel.open(nameIdMapHolderPath, StandardOpenOption.READ, StandardOpenOption.WRITE)) {
+      writeNameIdEntry(nameIdMapHolder, nameFileIdEntry, sync);
+    }
+  }
+
+  private void writeNameIdEntry(
+      final FileChannel nameIdMapHolder, final NameFileIdEntry nameFileIdEntry, final boolean sync)
+      throws IOException {
+    final var xxHashSize = 8;
+    final var recordLenSize = 4;
+
+    final var nameSize = StringSerializer.staticGetObjectSize(nameFileIdEntry.getName());
+    final var fileNameSize = StringSerializer.staticGetObjectSize(
+        nameFileIdEntry.getFileSystemName());
+
+    // file id size + file name + file system name + xx_hash size + record_size size
+    final var serializedRecord =
+        ByteBuffer.allocate(
+            IntegerSerializer.INT_SIZE + nameSize + fileNameSize + xxHashSize + recordLenSize);
+
+    serializedRecord.position(xxHashSize + recordLenSize);
+
+    // serialize file id
+    serializedRecord.putInt(nameFileIdEntry.getFileId());
+
+    // serialize file name
+    StringSerializer.staticSerializeInByteBufferObject(nameFileIdEntry.getName(),
+        serializedRecord);
+
+    // serialize file system name
+    StringSerializer.staticSerializeInByteBufferObject(nameFileIdEntry.getFileSystemName(),
+        serializedRecord);
+
+    final var recordLen = serializedRecord.position() - xxHashSize - recordLenSize;
+    if (recordLen > MAX_FILE_RECORD_LEN) {
+      throw new StorageException(storageName,
+          "Maximum record length in file registry can not exceed "
+              + MAX_FILE_RECORD_LEN
+              + " bytes. But actual record length "
+              + recordLen);
+    }
+    serializedRecord.putInt(xxHashSize, recordLen);
+
+    final var xxHash =
+        DiskStorage.XX_HASH_64.hash(serializedRecord, xxHashSize + recordLenSize, recordLen,
+            DiskStorage.XX_HASH_SEED);
+    serializedRecord.putLong(0, xxHash);
+
+    serializedRecord.position(0);
+
+    IOUtils.writeByteBuffer(serializedRecord, nameIdMapHolder, nameIdMapHolder.size());
+    //noinspection ResultOfMethodCallIgnored
+    nameIdMapHolder.write(serializedRecord);
+
+    if (sync) {
+      nameIdMapHolder.force(true);
+    }
+  }
+
+  /**
+   * "Drop every {@code writeCachePages} dirty entry for this fileId" delegate. Forwards to
+   * the range-scoped overload with {@code minPageIndex = 0}, which matches every page index.
+   */
+  private void removeCachedPages(final int fileId) {
+    removeCachedPages(fileId, 0);
+  }
+
+  /**
+   * Drops the {@code writeCachePages} entries at {@code pageIndex >= minPageIndex} for the
+   * given file via {@link RemoveFilePagesTask} on the single-threaded commit executor.
+   * Routing through the commit executor matters because the periodic-flush task runs on the
+   * same executor, so dispatching the purge there orders it cleanly against any in-flight
+   * flush.
+   *
+   * <p>With {@code minPageIndex = 0} this is "drop every dirty entry for this fileId" — the
+   * shape used by {@code closeFile} / {@code truncateFile} / {@code deleteFile}. With a
+   * positive {@code minPageIndex} the entries below the minimum survive — the shape used by
+   * {@link #shrinkFile(long, long)} for the recovery-time orphan-truncation pass (those
+   * entries belong to file regions the truncate does NOT drop and must survive the next
+   * periodic flush).
+   */
+  private void removeCachedPages(final int fileId, final int minPageIndex) {
+    final var future =
+        commitExecutor().submit(new RemoveFilePagesTask(this, fileId, minPageIndex));
+    try {
+      future.get();
+    } catch (final java.lang.InterruptedException e) {
+      throw BaseException.wrapException(
+          new ThreadInterruptedException("File data removal was interrupted"), e, storageName);
+    } catch (final Exception e) {
+      throw BaseException.wrapException(
+          new WriteCacheException(storageName, "File data removal was abnormally terminated"), e,
+          storageName);
+    }
+  }
+
+  @Nullable private CachePointer loadFileContent(
+      final int internalFileId, final long pageIndex, final boolean verifyChecksums)
+      throws IOException {
+    final var fileId = composeFileId(id, internalFileId);
+    try {
+      final var entry = files.acquire(fileId);
+      try {
+        final var fileClassic = entry.get();
+        if (fileClassic == null) {
+          throw new IllegalArgumentException(
+              "File with id " + internalFileId + " not found in WOW Cache");
+        }
+
+        final var pagePosition = pageIndex * pageSize;
+        final var pageEndPosition = pagePosition + pageSize;
+
+        // if page is not stored in the file may be page is stored in double write log
+        if (fileClassic.getFileSize() >= pageEndPosition) {
+          var pageFrame = pageFramePool.acquire(true, Intention.LOAD_PAGE_FROM_DISK);
+          var buffer = pageFrame.getBuffer();
+
+          assert buffer.position() == 0;
+          assert buffer.order() == ByteOrder.nativeOrder();
+
+          fileClassic.read(pagePosition, buffer, false);
+
+          if (verifyChecksums
+              && (checksumMode == ChecksumMode.StoreAndVerify
+                  || checksumMode == ChecksumMode.StoreAndThrow
+                  || checksumMode == ChecksumMode.StoreAndSwitchReadOnlyMode)) {
+            // if page is broken inside of data file we check double write log
+            if (!verifyMagicChecksumAndDecryptPage(buffer, internalFileId, pageIndex)) {
+              final var doubleWritePointer =
+                  doubleWriteLog.loadPage(internalFileId, (int) pageIndex, bufferPool);
+
+              if (doubleWritePointer == null) {
+                assertPageIsBroken(pageIndex, fileId, pageFrame);
+              } else {
+                // Copy recovered data from double-write log into the PageFrame's buffer
+                // and release the temporary double-write pointer back to ByteBufferPool.
+                var dblBuffer = doubleWritePointer.getNativeByteBuffer();
+                buffer.put(0, dblBuffer, 0, dblBuffer.capacity());
+                bufferPool.release(doubleWritePointer);
+
+                if (!verifyMagicChecksumAndDecryptPage(buffer, internalFileId, pageIndex)) {
+                  assertPageIsBroken(pageIndex, fileId, pageFrame);
+                }
+              }
+            }
+          }
+
+          buffer.position(0);
+          return new CachePointer(pageFrame, pageFramePool, fileId, (int) pageIndex);
+        } else {
+          final var pointer =
+              doubleWriteLog.loadPage(internalFileId, (int) pageIndex, bufferPool);
+          if (pointer != null) {
+            final var buffer = pointer.getNativeByteBuffer();
+            assert buffer.position() == 0;
+
+            if (verifyChecksums
+                && (checksumMode == ChecksumMode.StoreAndVerify
+                    || checksumMode == ChecksumMode.StoreAndThrow
+                    || checksumMode == ChecksumMode.StoreAndSwitchReadOnlyMode)) {
+              if (!verifyMagicChecksumAndDecryptPage(buffer, internalFileId, pageIndex)) {
+                assertPageIsBroken(pageIndex, fileId, pointer);
+              }
+            }
+          }
+
+          return null;
+        }
+      } finally {
+        files.release(entry);
+      }
+    } catch (final java.lang.InterruptedException e) {
+      throw BaseException.wrapException(
+          new StorageException(storageName, "Data load was interrupted"), e, storageName);
+    }
+  }
+
+  private void assertPageIsBroken(long pageIndex, long fileId, Pointer pointer) {
+    final var message = formatPageBrokenMessage(pageIndex, fileId);
+
+    if (checksumMode == ChecksumMode.StoreAndThrow) {
+      bufferPool.release(pointer);
+      throw new StorageException(storageName, message);
+    } else if (checksumMode == ChecksumMode.StoreAndSwitchReadOnlyMode) {
+      dumpStackTrace(message);
+      callPageIsBrokenListeners(fileNameById(fileId), pageIndex);
+    }
+    // StoreAndVerify: log only (via formatPageBrokenMessage), return broken page
+    // to caller for best-effort use.
+  }
+
+  private void assertPageIsBroken(long pageIndex, long fileId, PageFrame pageFrame) {
+    final var message = formatPageBrokenMessage(pageIndex, fileId);
+
+    if (checksumMode == ChecksumMode.StoreAndThrow) {
+      pageFramePool.release(pageFrame);
+      throw new StorageException(storageName, message);
+    } else if (checksumMode == ChecksumMode.StoreAndSwitchReadOnlyMode) {
+      dumpStackTrace(message);
+      callPageIsBrokenListeners(fileNameById(fileId), pageIndex);
+    }
+    // StoreAndVerify: log only (via formatPageBrokenMessage), return broken page
+    // to caller for best-effort use.
+  }
+
+  private String formatPageBrokenMessage(long pageIndex, long fileId) {
+    final var message =
+        "Magic number or check sum verification failed for page `"
+            + pageIndex
+            + "` of `"
+            + fileNameById(fileId)
+            + "`.";
+    LogManager.instance().error(this, "%s", null, message);
+    return message;
+  }
+
+  private void addMagicChecksumAndEncryption(
+      final int intId, final int pageIndex, final ByteBuffer buffer) {
+    assert buffer.order() == ByteOrder.nativeOrder();
+
+    if (checksumMode != ChecksumMode.Off) {
+      buffer.position(PAGE_OFFSET_TO_CHECKSUM_FROM);
+      final var crc32 = new CRC32();
+      crc32.update(buffer);
+      final var computedChecksum = (int) crc32.getValue();
+
+      buffer.position(CHECKSUM_OFFSET);
+      buffer.putInt(computedChecksum);
+    }
+
+    if (aesKey != null) {
+      var magicNumber = buffer.getLong(MAGIC_NUMBER_OFFSET);
+
+      var updateCounter = magicNumber >>> 8;
+      updateCounter++;
+
+      if (checksumMode == ChecksumMode.Off) {
+        magicNumber = (updateCounter << 8) | MAGIC_NUMBER_WITHOUT_CHECKSUM_ENCRYPTED;
+      } else {
+        magicNumber = (updateCounter << 8) | MAGIC_NUMBER_WITH_CHECKSUM_ENCRYPTED;
+      }
+
+      buffer.putLong(MAGIC_NUMBER_OFFSET, magicNumber);
+      doEncryptionDecryption(intId, pageIndex, Cipher.ENCRYPT_MODE, buffer, updateCounter);
+    } else {
+      buffer.putLong(
+          MAGIC_NUMBER_OFFSET,
+          checksumMode == ChecksumMode.Off
+              ? MAGIC_NUMBER_WITHOUT_CHECKSUM
+              : MAGIC_NUMBER_WITH_CHECKSUM);
+    }
+  }
+
+  private void doEncryptionDecryption(
+      final int intId,
+      final int pageIndex,
+      final int mode,
+      final ByteBuffer buffer,
+      final long updateCounter) {
+    try {
+      final var cipher = CIPHER.get();
+      final SecretKey aesKey = new SecretKeySpec(this.aesKey, ALGORITHM_NAME);
+
+      final var updatedIv = new byte[iv.length];
+
+      for (var i = 0; i < IntegerSerializer.INT_SIZE; i++) {
+        updatedIv[i] = (byte) (iv[i] ^ ((pageIndex >>> i) & 0xFF));
+      }
+
+      for (var i = 0; i < IntegerSerializer.INT_SIZE; i++) {
+        updatedIv[i + IntegerSerializer.INT_SIZE] =
+            (byte) (iv[i + IntegerSerializer.INT_SIZE] ^ ((intId >>> i) & 0xFF));
+      }
+
+      for (var i = 0; i < LongSerializer.LONG_SIZE - 1; i++) {
+        updatedIv[i + 2 * IntegerSerializer.INT_SIZE] =
+            (byte) (iv[i + 2 * IntegerSerializer.INT_SIZE] ^ ((updateCounter >>> i) & 0xFF));
+      }
+
+      updatedIv[updatedIv.length - 1] = iv[iv.length - 1];
+
+      cipher.init(mode, aesKey, new IvParameterSpec(updatedIv));
+
+      final var outBuffer =
+          ByteBuffer.allocate(buffer.capacity() - CHECKSUM_OFFSET).order(ByteOrder.nativeOrder());
+
+      buffer.position(CHECKSUM_OFFSET);
+      cipher.doFinal(buffer, outBuffer);
+
+      buffer.position(CHECKSUM_OFFSET);
+      outBuffer.position(0);
+      buffer.put(outBuffer);
+
+    } catch (InvalidKeyException e) {
+      throw BaseException.wrapException(
+          new InvalidStorageEncryptionKeyException(storageName, e.getMessage()),
+          e, storageName);
+    } catch (InvalidAlgorithmParameterException e) {
+      throw new IllegalArgumentException("Invalid IV.", e);
+    } catch (IllegalBlockSizeException | BadPaddingException | ShortBufferException e) {
+      throw new IllegalStateException("Unexpected exception during CRT encryption.", e);
+    }
+  }
+
+  @SuppressWarnings("BooleanMethodIsAlwaysInverted")
+  private boolean verifyMagicChecksumAndDecryptPage(
+      final ByteBuffer buffer, final int intId, final long pageIndex) {
+    assert buffer.order() == ByteOrder.nativeOrder();
+
+    buffer.position(MAGIC_NUMBER_OFFSET);
+    final var magicNumber = buffer.getLong();
+
+    if ((aesKey == null && magicNumber != MAGIC_NUMBER_WITH_CHECKSUM)
+        || (magicNumber != MAGIC_NUMBER_WITH_CHECKSUM
+            && (magicNumber & 0xFF) != MAGIC_NUMBER_WITH_CHECKSUM_ENCRYPTED)) {
+      if ((aesKey == null && magicNumber != MAGIC_NUMBER_WITHOUT_CHECKSUM)
+          || (magicNumber != MAGIC_NUMBER_WITHOUT_CHECKSUM
+              && (magicNumber & 0xFF) != MAGIC_NUMBER_WITHOUT_CHECKSUM_ENCRYPTED)) {
+        return false;
+      }
+
+      if (aesKey != null && (magicNumber & 0xFF) == MAGIC_NUMBER_WITHOUT_CHECKSUM_ENCRYPTED) {
+        doEncryptionDecryption(
+            intId, (int) pageIndex, Cipher.DECRYPT_MODE, buffer, magicNumber >>> 8);
+      }
+
+      return true;
+    }
+
+    if (aesKey != null && (magicNumber & 0xFF) == MAGIC_NUMBER_WITH_CHECKSUM_ENCRYPTED) {
+      doEncryptionDecryption(
+          intId, (int) pageIndex, Cipher.DECRYPT_MODE, buffer, magicNumber >>> 8);
+    }
+
+    buffer.position(CHECKSUM_OFFSET);
+    final var storedChecksum = buffer.getInt();
+
+    buffer.position(PAGE_OFFSET_TO_CHECKSUM_FROM);
+    final var crc32 = new CRC32();
+    crc32.update(buffer);
+    final var computedChecksum = (int) crc32.getValue();
+
+    return computedChecksum == storedChecksum;
+  }
+
+  private void dumpStackTrace(final String message) {
+    final var stringWriter = new StringWriter();
+    final var printWriter = new PrintWriter(stringWriter);
+
+    printWriter.println(message);
+    final var exception = new Exception();
+    exception.printStackTrace(printWriter);
+    printWriter.flush();
+
+    LogManager.instance().error(this, stringWriter.toString(), null);
+  }
+
+  private void fsyncFiles() throws java.lang.InterruptedException, IOException {
+    for (int intFileId : idNameMap.keySet()) {
+      if (intFileId >= 0) {
+        final var extFileId = externalFileId(intFileId);
+
+        final var fileEntry = files.acquire(extFileId);
+        // such thing can happen during db restore
+        if (fileEntry == null) {
+          continue;
+        }
+        try {
+          final var fileClassic = fileEntry.get();
+          fileClassic.synch();
+        } finally {
+          files.release(fileEntry);
+        }
+      }
+    }
+
+    doubleWriteLog.truncate();
+  }
+
+  /**
+   * Removes every {@code writeCachePages} entry whose {@code pageKey} matches
+   * {@code (fileId == internalFileId && pageIndex >= minPageIndex)}. With
+   * {@code minPageIndex = 0} this is "drop every dirty entry for this fileId" — the shape
+   * used by {@code closeFile} / {@code truncateFile} / {@code deleteFile}. With a positive
+   * {@code minPageIndex} the dirty pages below the truncate target survive (they belong to
+   * file regions the truncate does NOT drop and must be persisted by the next periodic
+   * flush), while pages at or past the target are dropped before the underlying file
+   * shrink runs.
+   */
+  void doRemoveCachePages(int internalFileId, int minPageIndex) {
+    final var entryIterator =
+        writeCachePages.entrySet().iterator();
+    while (entryIterator.hasNext()) {
+      final var entry = entryIterator.next();
+      final var pageKey = entry.getKey();
+
+      if (pageKey.fileId == internalFileId && pageKey.pageIndex >= minPageIndex) {
+        final var pagePointer = entry.getValue();
+        final var groupLock = lockManager.acquireExclusiveLock(pageKey);
+        try {
+          long exclusiveStamp = pagePointer.acquireExclusiveLock();
+          try {
+            pagePointer.setWritersListener(null);
+            writeCacheSize.decrementAndGet();
+
+            removeFromDirtyPages(pageKey);
+          } finally {
+            pagePointer.releaseExclusiveLock(exclusiveStamp);
+          }
+
+          // Decrement writers referrer AFTER releasing the exclusive lock.
+          // decrementWritersReferrer() → decrementReferrer() may call
+          // pageFramePool.release() which acquires the same PageFrame's
+          // exclusive lock. StampedLock is non-reentrant, so calling this
+          // under the exclusive lock would deadlock.
+          // The group lock (lockManager) is still held, preventing concurrent
+          // modifications to this page key.
+          pagePointer.decrementWritersReferrer();
+
+          entryIterator.remove();
+        } finally {
+          groupLock.unlock();
+        }
+      }
+    }
+  }
+
+  public void setChecksumMode(final ChecksumMode checksumMode) { // for testing purposes only
+    this.checksumMode = checksumMode;
+  }
+
+  private void flushExclusivePagesIfNeeded() throws java.lang.InterruptedException, IOException {
+    final var ewcSize = exclusiveWriteCacheSize.get();
+    assert ewcSize >= 0;
+
+    if (ewcSize >= 0.8 * exclusiveWriteCacheMaxSize) {
+      flushExclusiveWriteCache(null, ewcSize);
+    }
+  }
+
+  @Nullable public Long executeFindDirtySegment() {
+    if (flushError != null) {
+      final var iAdditionalArgs = new Object[] {flushError.getMessage()};
+      LogManager.instance()
+          .error(
+              this,
+              "Can not calculate minimum LSN because of issue during data write, %s",
+              null,
+              iAdditionalArgs);
+      return null;
+    }
+
+    convertSharedDirtyPagesToLocal();
+
+    if (localDirtyPagesBySegment.isEmpty()) {
+      return null;
+    }
+
+    return localDirtyPagesBySegment.firstKey();
+  }
+
+  private void convertSharedDirtyPagesToLocal() {
+    for (final var entry : dirtyPages.entrySet()) {
+      final var localLSN = localDirtyPages.get(entry.getKey());
+
+      if (localLSN == null || localLSN.compareTo(entry.getValue()) > 0) {
+        localDirtyPages.put(entry.getKey(), entry.getValue());
+
+        final var segment = entry.getValue().getSegment();
+        var pages = localDirtyPagesBySegment.get(segment);
+        if (pages == null) {
+          pages = new TreeSet<>();
+          pages.add(entry.getKey());
+
+          localDirtyPagesBySegment.put(segment, pages);
+        } else {
+          pages.add(entry.getKey());
+        }
+      }
+    }
+
+    for (final var entry : localDirtyPages.entrySet()) {
+      dirtyPages.remove(entry.getKey(), entry.getValue());
+    }
+  }
+
+  private void removeFromDirtyPages(final PageKey pageKey) {
+    dirtyPages.remove(pageKey);
+
+    final var lsn = localDirtyPages.remove(pageKey);
+    if (lsn != null) {
+      final var segment = lsn.getSegment();
+      final var pages = localDirtyPagesBySegment.get(segment);
+      assert pages != null;
+
+      final var removed = pages.remove(pageKey);
+      if (pages.isEmpty()) {
+        localDirtyPagesBySegment.remove(segment);
+      }
+
+      assert removed;
+    }
+  }
+
+  private void flushWriteCacheFromMinLSN(
+      final long segStart, final long segEnd, final int pagesFlushLimit)
+      throws java.lang.InterruptedException, IOException {
+    // first we try to find page which contains the oldest not flushed changes
+    // that is needed to allow to compact WAL as earlier as possible
+    convertSharedDirtyPagesToLocal();
+
+    var copiedPages = 0;
+
+    var chunks = new ArrayList<ArrayList<WritePageContainer>>(16);
+    var chunk = new ArrayList<WritePageContainer>(16);
+
+    var currentSegment = segStart;
+
+    var chunksSize = 0;
+
+    var fileIdSizeMap = new Int2LongOpenHashMap();
+    fileIdSizeMap.defaultReturnValue(-1);
+
+    LogSequenceNumber maxFullLogLSN = null;
+    flushCycle : while (chunksSize < pagesFlushLimit) {
+      final var segmentPages = localDirtyPagesBySegment.get(currentSegment);
+
+      if (segmentPages == null) {
+        currentSegment++;
+
+        if (currentSegment >= segEnd) {
+          break;
+        }
+
+        continue;
+      }
+
+      final var lsnPagesIterator = segmentPages.iterator();
+      final List<PageKey> pageKeysToFlush = new ArrayList<>(pagesFlushLimit);
+
+      while (lsnPagesIterator.hasNext() && pageKeysToFlush.size() < pagesFlushLimit - chunksSize) {
+        final var pageKey = lsnPagesIterator.next();
+
+        // Non-durable pages must never appear in dirtyPages (and therefore not in
+        // localDirtyPagesBySegment). If this fires, updateDirtyPagesTable's early-return
+        // guard was bypassed.
+        assert !nonDurableFileIds.contains(pageKey.fileId)
+            : "Non-durable page found in dirty pages table: fileId=" + pageKey.fileId
+                + ", pageIndex=" + pageKey.pageIndex;
+
+        var fileId = pageKey.fileId;
+        var fileSize = fileIdSizeMap.get(fileId);
+
+        if (fileSize == -1) {
+          var fileForSize = files.get(externalFileId(fileId));
+          // File may have been deleted concurrently — skip this page.
+          if (fileForSize == null) {
+            continue;
+          }
+          fileSize = fileForSize.getUnderlyingFileSize();
+
+          if ((fileSize & (pageSize - 1)) != 0) {
+            throw new StorageException(storageName,
+                "Storage : "
+                    + storageName
+                    + ". File size is not multiple of page size. File id : "
+                    + fileId);
+          }
+          fileIdSizeMap.put(fileId, fileSize);
+        }
+
+        var diff = (pageKey.pageIndex * pageSize - fileSize) / pageSize;
+        // it is important to do not create holes in the file
+        // otherwise restore process after crash will be aborted
+        // because of invalid data
+        if (diff > 0) {
+          diff = Math.min(diff, pagesFlushLimit - chunksSize - pageKeysToFlush.size());
+          var startPageIndex = fileSize / pageSize;
+
+          for (var i = 0; i < diff; i++) {
+            pageKeysToFlush.add(new PageKey(fileId, startPageIndex + i));
+          }
+        }
+
+        var pageEnd = pageKey.pageIndex * pageSize + pageSize;
+        if (pageEnd > fileSize) {
+          fileIdSizeMap.put(fileId, pageEnd);
+        }
+
+        if (pageKeysToFlush.size() >= pagesFlushLimit - chunksSize) {
+          break;
+        }
+        pageKeysToFlush.add(pageKey);
+      }
+
+      long lastPageIndex = -1;
+      long lastFileId = -1;
+
+      for (final var pageKey : pageKeysToFlush) {
+        if (lastFileId == -1) {
+          if (!chunk.isEmpty()) {
+            throw new IllegalStateException("Chunk is not empty !");
+          }
+        } else {
+          if (lastPageIndex == -1) {
+            throw new IllegalStateException("Last page index is -1");
+          }
+
+          if (lastFileId != pageKey.fileId || lastPageIndex != pageKey.pageIndex - 1) {
+            if (!chunk.isEmpty()) {
+              chunks.add(chunk);
+              chunksSize += chunk.size();
+              chunk = new ArrayList<>();
+            }
+          }
+        }
+
+        final var pointer = writeCachePages.get(pageKey);
+
+        if (pointer == null) {
+          // we marked page as dirty but did not put it in cache yet
+          if (!chunk.isEmpty()) {
+            chunks.add(chunk);
+          }
+
+          break flushCycle;
+        }
+
+        long sharedStamp = pointer.tryAcquireSharedLock();
+        if (sharedStamp != 0) {
+          final LogSequenceNumber fullLogLSN;
+
+          final var directPointer =
+              bufferPool.acquireDirect(false, Intention.COPY_PAGE_DURING_FLUSH);
+          final var copy = directPointer.getNativeByteBuffer();
+          assert copy.position() == 0;
+          try {
+            final var buffer = pointer.getBuffer();
+
+            fullLogLSN = pointer.getEndLSN();
+
+            assert buffer != null;
+            assert buffer.position() == 0;
+            assert copy.position() == 0;
+
+            copy.put(0, buffer, 0, buffer.capacity());
+
+            removeFromDirtyPages(pageKey);
+
+            copiedPages++;
+          } finally {
+            pointer.releaseSharedLock(sharedStamp);
+          }
+
+          if (fullLogLSN != null
+              && (maxFullLogLSN == null || fullLogLSN.compareTo(maxFullLogLSN) > 0)) {
+            maxFullLogLSN = fullLogLSN;
+          }
+
+          copy.position(0);
+
+          // Store the shared lock stamp for later validation in removeWrittenPagesFromCache.
+          // validate(stamp) returns false if any exclusive lock was acquired since the stamp
+          // was issued — semantically identical to a version mismatch, since the version only
+          // incremented under exclusive lock.
+          chunk.add(new WritePageContainer(sharedStamp, copy, directPointer, pointer));
+
+          if (chunksSize + chunk.size() >= pagesFlushLimit) {
+            chunks.add(chunk);
+            chunksSize += chunk.size();
+            chunk = new ArrayList<>(16);
+
+            lastPageIndex = -1;
+            lastFileId = -1;
+          } else {
+            lastPageIndex = pageKey.pageIndex;
+            lastFileId = pageKey.fileId;
+          }
+        } else {
+          if (!chunk.isEmpty()) {
+            chunks.add(chunk);
+            chunksSize += chunk.size();
+            chunk = new ArrayList<>(16);
+          }
+
+          lastPageIndex = -1;
+          lastFileId = -1;
+
+          var fileForSize = files.get(externalFileId(pageKey.fileId));
+          // File may have been deleted concurrently — skip this page.
+          if (fileForSize == null) {
+            continue;
+          }
+          var fileSize = fileForSize.getUnderlyingFileSize();
+          if (pageKey.pageIndex * pageSize >= fileSize) {
+            // if we can not write at least one page outside of the size of the file on disk
+            // we should stop the process because otherwise hole in the file during restore
+            // after crash will be treated as a invalid data and restore process will be aborted
+
+            break flushCycle;
+          }
+        }
+      }
+
+      var chunksSizeBeforeFlush = chunksSize;
+
+      if (!chunk.isEmpty()) {
+        chunks.add(chunk);
+        chunksSize += chunk.size();
+        chunk = new ArrayList<>(16);
+      }
+
+      // Advance to the next segment when either:
+      //  (a) the inner iterator is exhausted (all pages in the segment have been
+      //      consumed — either collected into pageKeysToFlush or skipped because
+      //      their file was concurrently deleted), or
+      //  (b) no progress was made on this pass (chunksSize did not increase),
+      //      which happens when all pages in pageKeysToFlush were skipped in the
+      //      for-loop (e.g., files deleted between the collection and flush phases,
+      //      or all page locks failed on pages whose files are now deleted).
+      // Without this, the outer flushCycle loop would retry the same segment
+      // indefinitely when all its pages reference concurrently deleted files.
+      if (!lsnPagesIterator.hasNext() || chunksSize == chunksSizeBeforeFlush) {
+        currentSegment++;
+
+        if (currentSegment >= segEnd) {
+          break;
+        }
+      }
+    }
+
+    // Use partitionAndFlushChunks for defense-in-depth: if a non-durable page ever
+    // leaked into dirtyPages (bypassing the updateDirtyPagesTable guard), it would be
+    // routed to flushNonDurablePages instead of going through the DWL/fsync path.
+    // The assert at the top of the dirty-page iteration loop is the primary guard,
+    // but it is disabled in production (-ea not set).
+    final var flushedPages = partitionAndFlushChunks(chunks, maxFullLogLSN);
+    if (copiedPages != flushedPages) {
+      throw new IllegalStateException(
+          "Copied pages (" + copiedPages + " ) != flushed pages (" + flushedPages + ")");
+    }
+  }
+
+  void writeValidPageInFile(int internalFileId, int pageIndex) {
+    if (flushError != null) {
+      LogManager.instance()
+          .error(
+              this,
+              "Can not write valid page in file because of the problems with data write, %s",
+              null,
+              flushError.getMessage());
+    }
+
+    if (stopFlush) {
+      return;
+    }
+
+    try {
+      var pagePosition = (long) pageIndex * pageSize;
+      var entry = files.acquire(externalFileId(internalFileId));
+      try {
+        var file = entry.get();
+        if (file.getUnderlyingFileSize() <= pagePosition) {
+          var pointer =
+              DirectMemoryAllocator.instance()
+                  .allocate(pageSize, true, Intention.ADD_NEW_PAGE_IN_FILE);
+          try {
+            var buffer = pointer.getNativeByteBuffer();
+            DurablePage.setLogSequenceNumberForPage(buffer, new LogSequenceNumber(-1, -1));
+            addMagicChecksumAndEncryption(internalFileId, pageIndex, buffer);
+
+            buffer.position(0);
+            file.write(pagePosition, buffer);
+          } finally {
+            DirectMemoryAllocator.instance().deallocate(pointer);
+          }
+        }
+      } finally {
+        files.release(entry);
+      }
+    } catch (final IOException | java.lang.InterruptedException e) {
+      throw BaseException.wrapException(
+          new StorageException(storageName,
+              "Storage : "
+                  + storageName
+                  + "Error during of writing initial blank page for file  "
+                  + idNameMap.get(internalFileId)),
+          e, storageName);
+    }
+  }
+
+  private int flushPages(
+      final ArrayList<ArrayList<WritePageContainer>> chunks, final LogSequenceNumber fullLogLSN)
+      throws java.lang.InterruptedException, IOException {
+    if (chunks.isEmpty()) {
+      return 0;
+    }
+
+    if (fullLogLSN != null) {
+      var flushedLSN = writeAheadLog.getFlushedLsn();
+      while (flushedLSN == null || flushedLSN.compareTo(fullLogLSN) < 0) {
+        writeAheadLog.flush();
+        flushedLSN = writeAheadLog.getFlushedLsn();
+      }
+    }
+
+    final boolean fsyncFiles;
+
+    var flushedPages = 0;
+
+    final var containerPointers = new ArrayList<Pointer>(chunks.size());
+    final var containerBuffers = new ArrayList<ByteBuffer>(chunks.size());
+    final var chunkPageIndexes = new IntArrayList(chunks.size());
+    final var chunkFileIds = new IntArrayList(chunks.size());
+
+    final var buffersByFileId =
+        new Long2ObjectOpenHashMap<ArrayList<RawPairLongObject<ByteBuffer>>>();
+    try {
+      flushedPages =
+          copyPageChunksIntoTheBuffers(
+              chunks,
+              flushedPages,
+              containerPointers,
+              containerBuffers,
+              buffersByFileId,
+              chunkPageIndexes,
+              chunkFileIds);
+      fsyncFiles = doubleWriteLog.write(containerBuffers, chunkFileIds, chunkPageIndexes);
+      writePageChunksToFiles(buffersByFileId);
+    } catch (final Exception | Error e) {
+      // Release per-page copy buffers on error to prevent direct memory leak.
+      // Each WritePageContainer holds a pageCopyDirectMemoryPointer allocated by
+      // the caller (bufferPool.acquireDirect); normally released by
+      // removeWrittenPagesFromCache, which is skipped on the error path.
+      // We catch Error (not just Exception) because this method re-throws —
+      // buffers must be released before any throwable propagates to the caller.
+      for (final var chunk : chunks) {
+        for (final var chunkPage : chunk) {
+          bufferPool.release(chunkPage.pageCopyDirectMemoryPointer);
+        }
+      }
+      throw e;
+    } finally {
+      for (final var containerPointer : containerPointers) {
+        if (containerPointer != null) {
+          DirectMemoryAllocator.instance().deallocate(containerPointer);
+        }
+      }
+    }
+
+    if (fsyncFiles) {
+      fsyncFiles();
+    }
+
+    removeWrittenPagesFromCache(chunks);
+
+    return flushedPages;
+  }
+
+  /**
+   * Flushes non-durable pages to their data files without WAL sync, double-write log, or
+   * fsync. Non-durable data is discarded on crash, so these protections are unnecessary.
+   * On I/O error, logs a warning but does NOT set {@code flushError} — a non-durable flush
+   * failure must not block durable flushes.
+   */
+  private int flushNonDurablePages(final ArrayList<ArrayList<WritePageContainer>> chunks) {
+    if (chunks.isEmpty()) {
+      return 0;
+    }
+
+    // Count total pages upfront so we can return the correct count even on error.
+    // The caller (flushExclusiveWriteCache) already incremented copiedPages for these
+    // pages, so returning a matching count prevents the copiedPages != flushedPages
+    // invariant check from crashing the flush thread on a non-durable I/O error.
+    var totalPages = 0;
+    for (final var chunk : chunks) {
+      totalPages += chunk.size();
+    }
+
+    var flushedPages = 0;
+
+    final var containerPointers = new ArrayList<Pointer>(chunks.size());
+    final var containerBuffers = new ArrayList<ByteBuffer>(chunks.size());
+    final var chunkPageIndexes = new IntArrayList(chunks.size());
+    final var chunkFileIds = new IntArrayList(chunks.size());
+
+    final var buffersByFileId =
+        new Long2ObjectOpenHashMap<ArrayList<RawPairLongObject<ByteBuffer>>>();
+    try {
+      flushedPages =
+          copyPageChunksIntoTheBuffers(
+              chunks,
+              flushedPages,
+              containerPointers,
+              containerBuffers,
+              buffersByFileId,
+              chunkPageIndexes,
+              chunkFileIds);
+      // Skip doubleWriteLog.write() — non-durable pages do not need DWL protection
+      writePageChunksToFiles(buffersByFileId);
+      // Skip fsyncFiles() — non-durable data does not need to be forced to stable storage
+    } catch (final Exception | Error e) {
+      // Non-durable data is discardable — log and continue without setting flushError.
+      // Do NOT call removeWrittenPagesFromCache here — pages may not have been written
+      // successfully, so they must remain in the write cache for retry on the next flush.
+      // We catch Error (not just Exception) so that per-page copy buffers are released
+      // even on OOM or other fatal conditions — matching the flushPages error path.
+      LogManager.instance()
+          .warn(
+              this,
+              "Error flushing non-durable pages in storage %s. Data will be discarded on crash.",
+              e,
+              storageName);
+      // Release per-page copy buffers to prevent direct memory leak. Each
+      // WritePageContainer holds a pageCopyDirectMemoryPointer allocated by the caller
+      // (bufferPool.acquireDirect); normally released by removeWrittenPagesFromCache,
+      // which we skip on error.
+      for (final var chunk : chunks) {
+        for (final var chunkPage : chunk) {
+          bufferPool.release(chunkPage.pageCopyDirectMemoryPointer);
+        }
+      }
+      return totalPages;
+    } finally {
+      for (final var containerPointer : containerPointers) {
+        if (containerPointer != null) {
+          DirectMemoryAllocator.instance().deallocate(containerPointer);
+        }
+      }
+    }
+
+    removeWrittenPagesFromCache(chunks);
+
+    return flushedPages;
+  }
+
+  /**
+   * Partitions chunks by durability and flushes each group through the appropriate path:
+   * durable chunks go through {@link #flushPages} (WAL sync + DWL + fsync), non-durable
+   * chunks go through {@link #flushNonDurablePages} (write only, no crash protection).
+   *
+   * @return total number of pages flushed across both paths
+   */
+  private int partitionAndFlushChunks(
+      final ArrayList<ArrayList<WritePageContainer>> chunks,
+      final LogSequenceNumber fullLogLSN)
+      throws java.lang.InterruptedException, IOException {
+    if (chunks.isEmpty()) {
+      return 0;
+    }
+
+    // Capture a consistent snapshot of the non-durable file ID set. The volatile read
+    // happens once here instead of per-chunk, ensuring all chunks in a single call are
+    // classified against the same snapshot.
+    final var localNonDurableFileIds = nonDurableFileIds;
+
+    // Fast path: when no non-durable files exist (common case for existing databases),
+    // skip partitioning entirely — all chunks are durable.
+    if (localNonDurableFileIds.isEmpty()) {
+      return flushPages(chunks, fullLogLSN);
+    }
+
+    final var durableChunks = new ArrayList<ArrayList<WritePageContainer>>(chunks.size());
+    final var nonDurableChunks = new ArrayList<ArrayList<WritePageContainer>>(chunks.size());
+
+    for (final var chunk : chunks) {
+      if (chunk.isEmpty()) {
+        continue;
+      }
+      // All pages in a chunk share the same file (chunks are split on file boundaries
+      // in flushExclusiveWriteCache and executeFileFlush), so checking the first page
+      // is sufficient to classify the entire chunk.
+      final var firstPage = chunk.getFirst();
+      final var fileId = firstPage.originalPagePointer.getFileId();
+      if (localNonDurableFileIds.contains(internalFileId(fileId))) {
+        nonDurableChunks.add(chunk);
+      } else {
+        durableChunks.add(chunk);
+      }
+    }
+
+    var flushed = 0;
+    try {
+      flushed += flushPages(durableChunks, fullLogLSN);
+    } catch (final Exception | Error e) {
+      // If the durable flush fails, release non-durable chunk buffers that would
+      // otherwise leak (flushNonDurablePages is never called on the error path).
+      for (final var chunk : nonDurableChunks) {
+        for (final var chunkPage : chunk) {
+          bufferPool.release(chunkPage.pageCopyDirectMemoryPointer);
+        }
+      }
+      throw e;
+    }
+    flushed += flushNonDurablePages(nonDurableChunks);
+    return flushed;
+  }
+
+  private void removeWrittenPagesFromCache(ArrayList<ArrayList<WritePageContainer>> chunks) {
+    for (final List<WritePageContainer> chunk : chunks) {
+      for (var chunkPage : chunk) {
+        // Always release the page copy's direct memory, even if stamp validation
+        // fails. Without this, the buffer pool allocation made during the flush copy
+        // phase (e.g., in executeFileFlush) would leak.
+        try {
+          final var pointer = chunkPage.originalPagePointer;
+
+          final var pageKey =
+              new PageKey(internalFileId(pointer.getFileId()), pointer.getPageIndex());
+
+          final var lock = lockManager.acquireExclusiveLock(pageKey);
+          try {
+            // Validate the stamp captured during the copy phase. If no exclusive lock was
+            // acquired on the PageFrame since the copy, the page data is still consistent
+            // and the write cache entry can be removed. This is semantically identical to
+            // the old version comparison: version only incremented under exclusive lock,
+            // and validate(stamp) detects any exclusive lock acquisition since the stamp.
+            final var pageFrame = pointer.getPageFrame();
+            assert pageFrame != null : "Write cache page must have a PageFrame";
+            // validate() works on released read stamps — it checks only the write-lock
+            // sequence counter, not whether the read lock is still held.
+            if (pageFrame != null && pageFrame.validate(chunkPage.pageStamp)) {
+              var removed = writeCachePages.remove(pageKey);
+              if (removed == null) {
+                throw new IllegalStateException("Page is not found in write cache");
+              }
+
+              writeCacheSize.decrementAndGet();
+
+              // Decrement BEFORE nulling the listener: the page was flushed
+              // successfully, so the listener notification should fire.
+              // (Contrast with doRemoveCachePages where the listener is nulled
+              // first because the file is being deleted and notification must
+              // be suppressed.)
+              pointer.decrementWritersReferrer();
+              pointer.setWritersListener(null);
+            }
+          } finally {
+            lock.unlock();
+          }
+        } finally {
+          bufferPool.release(chunkPage.pageCopyDirectMemoryPointer);
+        }
+      }
+    }
+  }
+
+  private int copyPageChunksIntoTheBuffers(
+      ArrayList<ArrayList<WritePageContainer>> chunks,
+      int flushedPages,
+      ArrayList<Pointer> containerPointers,
+      ArrayList<ByteBuffer> containerBuffers,
+      Long2ObjectOpenHashMap<ArrayList<RawPairLongObject<ByteBuffer>>> buffersByFileId,
+      IntArrayList chunkPageIndexes,
+      IntArrayList chunkFileIds) {
+    for (final List<WritePageContainer> chunk : chunks) {
+      if (chunk.isEmpty()) {
+        continue;
+      }
+      flushedPages += chunk.size();
+
+      final var containerPointer =
+          DirectMemoryAllocator.instance()
+              .allocate(
+                  chunk.size() * pageSize, false, Intention.ALLOCATE_CHUNK_TO_WRITE_DATA_IN_BATCH);
+      final var containerBuffer = containerPointer.getNativeByteBuffer();
+
+      containerPointers.add(containerPointer);
+      containerBuffers.add(containerBuffer);
+      assert containerBuffer.position() == 0;
+
+      for (var chunkPage : chunk) {
+        final var buffer = chunkPage.copyOfPage;
+
+        final var pointer = chunkPage.originalPagePointer;
+
+        addMagicChecksumAndEncryption(
+            extractFileId(pointer.getFileId()), pointer.getPageIndex(), buffer);
+
+        buffer.position(0);
+        containerBuffer.put(buffer);
+      }
+
+      final var firstPage = chunk.getFirst();
+      final var firstCachePointer = firstPage.originalPagePointer;
+
+      final var fileId = firstCachePointer.getFileId();
+      final var pageIndex = firstCachePointer.getPageIndex();
+
+      var fileBuffers = buffersByFileId.computeIfAbsent(fileId, (id) -> new ArrayList<>());
+      fileBuffers.add(new RawPairLongObject<>(((long) pageIndex) * pageSize, containerBuffer));
+
+      chunkPageIndexes.add(pageIndex);
+      chunkFileIds.add(internalFileId(fileId));
+    }
+    return flushedPages;
+  }
+
+  private void writePageChunksToFiles(
+      Long2ObjectOpenHashMap<ArrayList<RawPairLongObject<ByteBuffer>>> buffersByFileId)
+      throws java.lang.InterruptedException, IOException {
+    final List<ClosableEntry<Long, File>> acquiredFiles = new ArrayList<>(buffersByFileId.size());
+    final List<IOResult> ioResults = new ArrayList<>(buffersByFileId.size());
+
+    Long2ObjectOpenHashMap.Entry<ArrayList<RawPairLongObject<ByteBuffer>>> entry;
+    Iterator<Long2ObjectMap.Entry<ArrayList<RawPairLongObject<ByteBuffer>>>> filesIterator;
+
+    filesIterator = buffersByFileId.long2ObjectEntrySet().iterator();
+    entry = null;
+    // acquire as much files as possible and flush data
+    while (true) {
+      if (entry == null) {
+        if (filesIterator.hasNext()) {
+          entry = filesIterator.next();
+        } else {
+          break;
+        }
+      }
+
+      final var fileEntry = files.tryAcquire(entry.getLongKey());
+      if (fileEntry != null) {
+        final var file = fileEntry.get();
+
+        var bufferList = entry.getValue();
+
+        ioResults.add(file.write(bufferList));
+        acquiredFiles.add(fileEntry);
+
+        entry = null;
+      } else {
+        if (ioResults.size() != acquiredFiles.size()) {
+          throw new IllegalStateException("Not all data are written to the files.");
+        }
+
+        if (!ioResults.isEmpty()) {
+          for (final var ioResult : ioResults) {
+            ioResult.await();
+          }
+
+          for (final var closableEntry : acquiredFiles) {
+            files.release(closableEntry);
+          }
+
+          ioResults.clear();
+          acquiredFiles.clear();
+        } else {
+          Thread.yield();
+        }
+      }
+    }
+
+    if (ioResults.size() != acquiredFiles.size()) {
+      throw new IllegalStateException("Not all data are written to the files.");
+    }
+
+    if (!ioResults.isEmpty()) {
+      for (final var ioResult : ioResults) {
+        ioResult.await();
+      }
+
+      for (final var closableEntry : acquiredFiles) {
+        files.release(closableEntry);
+      }
+    }
+  }
+
+  private void flushExclusiveWriteCache(final CountDownLatch latch, long pagesToFlushLimit)
+      throws java.lang.InterruptedException, IOException {
+    // method flushes at least chunkSize pages that exist in write cache but do not exist
+    // in read cache. It is important to do not flush more than chunkSize pages at once because
+    // it can lead to the situation when a lot of RAM will be consumed during page flush.
+    // Method iterates over pages that do not exist in read cache in order sorted by file and
+    // position
+    // of page in file. It is important to do not create holes in the file
+    // otherwise restore process after crash will be aborted
+    // because of invalid data.
+    // Pages are gathered together in chunks of adjacent pages in order to minimize the number of
+    // IO operations. Once amount of pages needed to be flushed reaches chunk size it is flushed and
+    // process continued till requested amount of pages not flushed.
+
+    // amount of dirty pages that exist only in write cache
+    final var ewcSize = exclusiveWriteCacheSize.get();
+
+    // Snapshot for assertions — same pattern as executeFileFlush.
+    final var localNonDurableFileIds = nonDurableFileIds;
+
+    // we flush at least chunkSize pages but no more than amount of exclusive pages.
+    pagesToFlushLimit = Math.min(Math.max(pagesToFlushLimit, chunkSize), ewcSize);
+
+    var chunks = new ArrayList<ArrayList<WritePageContainer>>(16);
+    var chunk = new ArrayList<WritePageContainer>(16);
+
+    // latch is hold by write thread if limit of pages in write cache exceeded
+    // it is important to release it once we lower amount of pages in write cache to the limit.
+    if (latch != null && ewcSize <= exclusiveWriteCacheMaxSize) {
+      latch.countDown();
+    }
+
+    LogSequenceNumber maxFullLogLSN = null;
+
+    // cache of files sizes.
+    var fileSizeMap = new Int2LongOpenHashMap();
+    fileSizeMap.defaultReturnValue(-1);
+
+    var flushedPages = 0;
+    var copiedPages = 0;
+    // Tracks flushedPages at the start of each cycle to detect infinite loops:
+    // if a flushCycle reset occurs but no pages were flushed since the last reset,
+    // the same conditions will repeat forever (e.g., pages in exclusiveWritePages
+    // with no corresponding writeCachePages entry and file too small to extend).
+    var flushedPagesAtCycleStart = 0;
+
+    // total amount of pages in chunks that precedes current/active chunk
+    var prevChunksSize = 0;
+    long lastFileId = -1;
+    long lastPageIndex = -1;
+
+    var iterator = exclusiveWritePages.iterator();
+    flushCycle : while (flushedPages < pagesToFlushLimit) {
+      // if nothing to flush we should add the last gathered chunk and stop cycle.
+      if (!iterator.hasNext()) {
+        if (!chunk.isEmpty()) {
+          chunks.add(chunk);
+          chunk = new ArrayList<>(16);
+        }
+
+        break;
+      }
+
+      final var pageKeyToFlush = iterator.next();
+      var fileSize = fileSizeMap.get(pageKeyToFlush.fileId);
+      if (fileSize < 0) {
+        var file = files.get(externalFileId(pageKeyToFlush.fileId));
+        // File may have been deleted (e.g., during backup restore). Skip pages for
+        // deleted files — they will be cleaned up by doRemoveCachePages or the next
+        // flush cycle.
+        if (file == null) {
+          continue;
+        }
+        fileSize = file.getUnderlyingFileSize();
+        fileSizeMap.put(pageKeyToFlush.fileId, fileSize);
+      }
+
+      var pagesToFlush = new ArrayList<PageKey>();
+      pagesToFlush.add(pageKeyToFlush);
+
+      var diff = (pageKeyToFlush.pageIndex * pageSize - fileSize) / pageSize;
+      // it is important to do not create holes in the file
+      // otherwise restore process after crash will be aborted
+      if (diff > 0) {
+        var startPageIndex = fileSize / pageSize;
+        for (var i = 0; i < diff; i++) {
+          pagesToFlush.add(new PageKey(pageKeyToFlush.fileId, startPageIndex + i));
+        }
+      }
+      // pages are sorted by position in index, so file size will be correctly incremented
+      var pageEnd = pageKeyToFlush.pageIndex * pageSize + pageSize;
+      if (pageEnd > fileSize) {
+        fileSizeMap.put(pageKeyToFlush.fileId, pageEnd);
+      }
+
+      for (var pageKey : pagesToFlush) {
+        final var pointer = writeCachePages.get(pageKey);
+        // because accesses between maps not synchronized there could be eventual consistency
+        // between exclusiveWritePages and writeCachePages. We treat writeCachePages as source of
+        // truth.
+        if (pointer == null) {
+          var file = files.get(externalFileId(pageKey.fileId));
+          // File may have been deleted — skip pages for deleted files.
+          if (file == null) {
+            continue;
+          }
+          if (file.getUnderlyingFileSize() < (pageKey.pageIndex + 1) * pageSize) {
+            // if we can not write at least one page outside the size of the file on disk
+            // we should stop the process because otherwise hole in the file during restore
+            // after crash will be treated as an invalid data and restore process will be
+            // aborted
+            if (!chunk.isEmpty()) {
+              chunks.add(chunk);
+              chunk = new ArrayList<>(16);
+            }
+
+            flushedPages += partitionAndFlushChunks(chunks, maxFullLogLSN);
+            if (latch != null && exclusiveWriteCacheSize.get() <= exclusiveWriteCacheMaxSize) {
+              latch.countDown();
+            }
+
+            // If no pages were flushed since the last cycle reset, the same conditions
+            // will repeat: pages exist in exclusiveWritePages with null writeCachePages
+            // entries and the file is too small to extend. Break to avoid an infinite
+            // loop that would monopolize the commitExecutor thread and deadlock callers
+            // waiting to submit tasks (e.g., deleteFile).
+            if (flushedPages == flushedPagesAtCycleStart) {
+              LogManager.instance()
+                  .warn(
+                      this,
+                      storageName
+                          + ": flushExclusiveWriteCache: no progress in flush cycle, breaking."
+                          + " exclusiveWritePages.size=%d, pageKey=(%d,%d)",
+                      (Throwable) null,
+                      exclusiveWritePages.size(),
+                      pageKey.fileId,
+                      pageKey.pageIndex);
+              break flushCycle;
+            }
+
+            // reset flush cycle
+            assert flushedPages > flushedPagesAtCycleStart
+                : "Expected flush progress: flushedPages=" + flushedPages
+                    + " flushedPagesAtCycleStart=" + flushedPagesAtCycleStart;
+            flushedPagesAtCycleStart = flushedPages;
+            chunks.clear();
+            prevChunksSize = 0;
+            iterator = exclusiveWritePages.iterator();
+            fileSizeMap.clear();
+            continue flushCycle;
+          }
+        } else {
+          long sharedStamp = pointer.tryAcquireSharedLock();
+          if (sharedStamp != 0) {
+            final LogSequenceNumber fullLSN;
+
+            final var directPointer =
+                bufferPool.acquireDirect(false, Intention.COPY_PAGE_DURING_EXCLUSIVE_PAGE_FLUSH);
+            final var copy = directPointer.getNativeByteBuffer();
+            assert copy.position() == 0;
+            try {
+              final var buffer = pointer.getBuffer();
+
+              fullLSN = pointer.getEndLSN();
+
+              assert buffer != null;
+              assert buffer.position() == 0;
+              assert copy.position() == 0;
+
+              copy.put(0, buffer, 0, buffer.capacity());
+
+              removeFromDirtyPages(pageKey);
+
+              copiedPages++;
+            } finally {
+              pointer.releaseSharedLock(sharedStamp);
+            }
+
+            // Non-durable pages have null endLSN (setEndLSN is skipped in
+            // commitChanges), so they are naturally excluded from maxFullLogLSN
+            // by the null check. Only durable pages contribute to WAL pinning.
+            if (fullLSN != null
+                && (maxFullLogLSN == null || maxFullLogLSN.compareTo(fullLSN) < 0)) {
+              assert !localNonDurableFileIds.contains(internalFileId(pointer.getFileId()))
+                  : "Non-durable page should not have a non-null endLSN";
+              maxFullLogLSN = fullLSN;
+            }
+
+            assert copy.position() == 0;
+
+            if (!chunk.isEmpty()) {
+              if (lastFileId != pointer.getFileId()
+                  || lastPageIndex != pointer.getPageIndex() - 1) {
+                chunks.add(chunk);
+                prevChunksSize += chunk.size();
+                chunk = new ArrayList<>(16);
+              }
+            }
+
+            if (prevChunksSize + chunk.size() >= chunkSize) {
+              if (!chunk.isEmpty()) {
+                chunks.add(chunk);
+                chunk = new ArrayList<>(16);
+              }
+
+              flushedPages += partitionAndFlushChunks(chunks, maxFullLogLSN);
+
+              chunks.clear();
+              prevChunksSize = 0;
+            }
+
+            chunk.add(new WritePageContainer(sharedStamp, copy, directPointer, pointer));
+
+            lastFileId = pointer.getFileId();
+            lastPageIndex = pointer.getPageIndex();
+          } else {
+            if (!chunk.isEmpty()) {
+              chunks.add(chunk);
+              prevChunksSize += chunk.size();
+
+              chunk = new ArrayList<>(16);
+            }
+
+            var fileForSize = files.get(externalFileId(pageKey.fileId));
+            // File may have been deleted — skip pages for deleted files.
+            if (fileForSize == null) {
+              continue;
+            }
+            var underlyingFileSize = fileForSize.getUnderlyingFileSize();
+            // chunk size is reached flush limit, or we have a risk to have a hole in the file
+            // that will lead to error during restore after crash process
+            // we need to check only prevChunksSize because current chunk is empty
+            if (prevChunksSize >= this.chunkSize
+                || underlyingFileSize < (pageKey.pageIndex + 1) * pageSize) {
+              flushedPages += partitionAndFlushChunks(chunks, maxFullLogLSN);
+
+              chunks.clear();
+              prevChunksSize = 0;
+
+              if (latch != null && exclusiveWriteCacheSize.get() <= exclusiveWriteCacheMaxSize) {
+                latch.countDown();
+              }
+            }
+
+            if (underlyingFileSize < (pageKey.pageIndex + 1) * pageSize) {
+              // Break if no progress was made — same reasoning as the first
+              // flushCycle reset above.
+              if (flushedPages == flushedPagesAtCycleStart) {
+                LogManager.instance()
+                    .warn(
+                        this,
+                        storageName
+                            + ": flushExclusiveWriteCache: no progress in flush cycle, breaking."
+                            + " exclusiveWritePages.size=%d, pageKey=(%d,%d)",
+                        (Throwable) null,
+                        exclusiveWritePages.size(),
+                        pageKey.fileId,
+                        pageKey.pageIndex);
+                break flushCycle;
+              }
+              // reset flush cycle, we can not afford holes in files
+              assert flushedPages > flushedPagesAtCycleStart
+                  : "Expected flush progress: flushedPages=" + flushedPages
+                      + " flushedPagesAtCycleStart=" + flushedPagesAtCycleStart;
+              flushedPagesAtCycleStart = flushedPages;
+              iterator = exclusiveWritePages.iterator();
+              fileSizeMap.clear();
+              continue flushCycle;
+            }
+          }
+        }
+      }
+    }
+
+    if (!chunk.isEmpty()) {
+      chunks.add(chunk);
+    }
+
+    flushedPages += partitionAndFlushChunks(chunks, maxFullLogLSN);
+    if (copiedPages != flushedPages) {
+      throw new IllegalStateException(
+          "Copied pages (" + copiedPages + " ) != flushed pages (" + flushedPages + ")");
+    }
+  }
+
+  public Void executeFileFlush(IntOpenHashSet fileIdSet)
+      throws java.lang.InterruptedException, IOException {
+    if (flushError != null) {
+      final var iAdditionalArgs = new Object[] {flushError.getMessage()};
+      LogManager.instance()
+          .error(
+              this,
+              "Can not flush file data because of issue during data write, %s",
+              null,
+              iAdditionalArgs);
+      return null;
+    }
+
+    // Only flush WAL if at least one file in the set is durable. Non-durable
+    // files never produce WAL records, so flushing is unnecessary overhead.
+    final var localNonDurableFileIds = nonDurableFileIds;
+    if (localNonDurableFileIds.isEmpty()) {
+      // Common case: no non-durable files exist — all files are durable.
+      writeAheadLog.flush();
+    } else {
+      boolean hasDurableFile = false;
+      var idIterator = fileIdSet.intIterator();
+      while (idIterator.hasNext()) {
+        if (!localNonDurableFileIds.contains(idIterator.nextInt())) {
+          hasDurableFile = true;
+          break;
+        }
+      }
+      if (hasDurableFile) {
+        writeAheadLog.flush();
+      }
+    }
+
+    final var pagesToFlush = new TreeSet<PageKey>();
+    for (final var entry : writeCachePages.entrySet()) {
+      final var pageKey = entry.getKey();
+      if (fileIdSet.contains(pageKey.fileId)) {
+        pagesToFlush.add(pageKey);
+      }
+    }
+
+    LogSequenceNumber maxLSN = null;
+
+    final var chunks = new ArrayList<ArrayList<WritePageContainer>>(chunkSize);
+    for (final var pageKey : pagesToFlush) {
+      if (fileIdSet.contains(pageKey.fileId)) {
+        final var pagePointer = writeCachePages.get(pageKey);
+        final var pageLock = lockManager.acquireExclusiveLock(pageKey);
+        try {
+          long sharedStamp = pagePointer.tryAcquireSharedLock();
+          if (sharedStamp == 0) {
+            continue;
+          }
+          try {
+            final var buffer = pagePointer.getBuffer();
+
+            final var directPointer = bufferPool.acquireDirect(false, Intention.FILE_FLUSH);
+            final var copy = directPointer.getNativeByteBuffer();
+            assert copy.position() == 0;
+
+            assert buffer != null;
+            assert buffer.position() == 0;
+            copy.put(0, buffer, 0, buffer.capacity());
+
+            final var endLSN = pagePointer.getEndLSN();
+
+            // Non-durable pages have null endLSN (setEndLSN is skipped in
+            // commitChanges), so they are naturally excluded from maxLSN.
+            if (endLSN != null && (maxLSN == null || endLSN.compareTo(maxLSN) > 0)) {
+              maxLSN = endLSN;
+            }
+
+            var chunk = new ArrayList<WritePageContainer>(1);
+            chunk.add(
+                new WritePageContainer(sharedStamp, copy, directPointer, pagePointer));
+            chunks.add(chunk);
+
+            removeFromDirtyPages(pageKey);
+          } finally {
+            pagePointer.releaseSharedLock(sharedStamp);
+          }
+        } finally {
+          pageLock.unlock();
+        }
+
+        if (chunks.size() >= 4 * chunkSize) {
+          partitionAndFlushChunks(chunks, maxLSN);
+          chunks.clear();
+        }
+      }
+    }
+
+    partitionAndFlushChunks(chunks, maxLSN);
+
+    if (callFsync) {
+      var fileIdIterator = fileIdSet.intIterator();
+      while (fileIdIterator.hasNext()) {
+        final var intFileId = fileIdIterator.nextInt();
+
+        // Non-durable files do not need fsync — skip to avoid unnecessary I/O.
+        // Use the same snapshot as the WAL-guard loop above for consistency.
+        if (localNonDurableFileIds.contains(intFileId)) {
+          continue;
+        }
+
+        final var finalId = composeFileId(id, intFileId);
+        final var entry = files.acquire(finalId);
+        if (entry != null) {
+          try {
+            entry.get().synch();
+          } finally {
+            files.release(entry);
+          }
+        }
+      }
+    }
+
+    return null;
+  }
+
+  private static Cipher getCipherInstance() {
+    try {
+      return Cipher.getInstance(TRANSFORMATION);
+    } catch (NoSuchAlgorithmException | NoSuchPaddingException e) {
+      throw BaseException.wrapException(
+          new SecurityException((String) null,
+              "Implementation of encryption " + TRANSFORMATION + " is absent"),
+          e, (String) null);
+    }
+  }
+
+  @Override
+  public String getStorageName() {
+    return storageName;
+  }
+
+  @Nullable public RawPair<String, String> executeDeleteFile(long externalFileId)
+      throws IOException, java.lang.InterruptedException {
+    final var internalFileId = extractFileId(externalFileId);
+    final var fileId = composeFileId(id, internalFileId);
+
+    doRemoveCachePages(internalFileId, 0);
+
+    final var fileClassic = files.remove(fileId);
+
+    if (fileClassic != null) {
+      if (fileClassic.exists()) {
+        fileClassic.delete();
+      }
+
+      final var name = idNameMap.get(internalFileId);
+
+      idNameMap.remove(internalFileId);
+
+      nameIdMap.put(name, -internalFileId);
+      idNameMap.put(-internalFileId, name);
+
+      return new RawPair<>(fileClassic.getName(), name);
+    }
+
+    return null;
+  }
+
+  public void executePeriodicFlush(PeriodicFlushTask task) {
+    // backgroundFlushPaused is the test-only gate that lets WalTestUtils
+    // freeze background page flushes while a raw-file copy runs; the entry
+    // check here is what makes the barrier-submit in pauseBackgroundFlush
+    // safe (no work happens after pause returns until resume is called).
+    if (stopFlush || backgroundFlushPaused) {
+      return;
+    }
+
+    var flushInterval = pagesFlushInterval;
+
+    try {
+      if (flushError != null) {
+        final var iAdditionalArgs = new Object[] {flushError.getMessage()};
+        LogManager.instance()
+            .error(
+                this,
+                "Can not flush data because of issue during data write, %s",
+                null,
+                iAdditionalArgs);
+        return;
+      }
+
+      try {
+        if (writeCachePages.isEmpty()) {
+          return;
+        }
+
+        var ewcSize = exclusiveWriteCacheSize.get();
+        if (ewcSize >= 0) {
+          flushExclusiveWriteCache(null, Math.min(ewcSize, 4L * chunkSize));
+
+          if (exclusiveWriteCacheSize.get() > 0) {
+            flushInterval = 1;
+          }
+        }
+
+        // Check stopFlush / backgroundFlushPaused between flush phases so
+        // the flush aborts quickly when the cache is being shut down or a
+        // test has paused background flushing.
+        if (stopFlush || backgroundFlushPaused) {
+          return;
+        }
+
+        final var begin = writeAheadLog.begin();
+        final var end = writeAheadLog.end();
+        final var segments = end.getSegment() - begin.getSegment() + 1;
+
+        if (segments > 1) {
+          convertSharedDirtyPagesToLocal();
+
+          var firstSegment = localDirtyPagesBySegment.firstEntry();
+          if (firstSegment != null) {
+            final long firstSegmentIndex = firstSegment.getKey();
+            if (firstSegmentIndex < end.getSegment()) {
+              flushWriteCacheFromMinLSN(firstSegmentIndex, firstSegmentIndex + 1, chunkSize);
+            }
+          }
+
+          firstSegment = localDirtyPagesBySegment.firstEntry();
+          if (firstSegment != null && firstSegment.getKey() < end.getSegment()) {
+            flushInterval = 1;
+          }
+        }
+      } catch (final Error | Exception t) {
+        LogManager.instance().error(this, "Exception during data flush", t);
+        WOWCache.this.fireBackgroundDataFlushExceptionEvent(t);
+        flushError = t;
+      }
+    } finally {
+      if (flushInterval > 0 && !stopFlush && !backgroundFlushPaused) {
+        // Skip the re-arm while paused; resumeBackgroundFlush() restarts
+        // the periodic task explicitly when the pause is lifted.
+        flushFuture = commitExecutor().schedule(task, flushInterval, TimeUnit.MILLISECONDS);
+      }
+    }
+  }
+
+  public void executeFlush(CountDownLatch cacheBoundaryLatch, CountDownLatch completionLatch) {
+    if (stopFlush) {
+      return;
+    }
+
+    try {
+      if (flushError != null) {
+        final var iAdditionalArgs = new Object[] {flushError.getMessage()};
+        LogManager.instance()
+            .error(
+                this,
+                "Can not flush data because of issue during data write, %s",
+                null,
+                iAdditionalArgs);
+        return;
+      }
+
+      if (writeCachePages.isEmpty()) {
+        return;
+      }
+
+      final var ewcSize = exclusiveWriteCacheSize.get();
+
+      assert ewcSize >= 0;
+
+      if (cacheBoundaryLatch != null && ewcSize <= exclusiveWriteCacheMaxSize) {
+        cacheBoundaryLatch.countDown();
+      }
+
+      if (ewcSize > exclusiveWriteCacheMaxSize) {
+        flushExclusiveWriteCache(cacheBoundaryLatch, chunkSize);
+      }
+
+    } catch (final Error | Exception t) {
+      LogManager.instance().error(this, "Exception during data flush", t);
+      WOWCache.this.fireBackgroundDataFlushExceptionEvent(t);
+      flushError = t;
+    } finally {
+      if (cacheBoundaryLatch != null) {
+        cacheBoundaryLatch.countDown();
+      }
+
+      if (completionLatch != null) {
+        completionLatch.countDown();
+      }
+    }
+  }
+
+  public Void executeFlushTillSegment(long segmentId)
+      throws java.lang.InterruptedException, IOException {
+    if (flushError != null) {
+      final var iAdditionalArgs = new Object[] {flushError.getMessage()};
+      LogManager.instance()
+          .error(
+              this,
+              "Can not flush data till provided segment because of issue during data write, %s",
+              null,
+              iAdditionalArgs);
+      return null;
+    }
+
+    convertSharedDirtyPagesToLocal();
+    var firstEntry = localDirtyPagesBySegment.firstEntry();
+
+    if (firstEntry == null) {
+      return null;
+    }
+
+    long minDirtySegment = firstEntry.getKey();
+    while (minDirtySegment < segmentId) {
+      flushExclusivePagesIfNeeded();
+
+      flushWriteCacheFromMinLSN(writeAheadLog.begin().getSegment(), segmentId, chunkSize);
+
+      firstEntry = localDirtyPagesBySegment.firstEntry();
+
+      if (firstEntry == null) {
+        return null;
+      }
+
+      minDirtySegment = firstEntry.getKey();
+    }
+
+    return null;
+  }
+
+  private record WritePageContainer(long pageStamp, ByteBuffer copyOfPage,
+      Pointer pageCopyDirectMemoryPointer,
+      CachePointer originalPagePointer) {
+
+  }
+}

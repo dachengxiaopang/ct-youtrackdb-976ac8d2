@@ -1,0 +1,874 @@
+name: Java CI/CD Pipeline
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "develop" ]
+  pull_request:
+    types: [ opened, synchronize, reopened, ready_for_review ]
+  merge_group:
+    types: [ checks_requested ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  # Only cancel in-progress runs for PRs and merge queue, not for develop pushes.
+  # On develop, cancelling a running build when a non-buildable commit (e.g. docs)
+  # arrives would skip testing the buildable commits from the cancelled run.
+  cancel-in-progress: ${{ github.event_name != 'push' }}
+
+permissions:
+  contents: read
+  checks: write
+  pull-requests: write
+  actions: read
+
+jobs:
+  detect-changes:
+    name: Detect Build-Relevant Changes
+    if: github.event.pull_request.draft != true
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.filter.outputs.should_build }}
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v5
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: 'maven'
+          overwrite-settings: false
+
+      - name: Check for build-relevant changes
+        id: filter
+        env:
+          MAVEN_MIRROR_USERNAME: ${{ secrets.MAVEN_MIRROR_USERNAME }}
+          MAVEN_MIRROR_PASSWORD: ${{ secrets.MAVEN_MIRROR_PASSWORD }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          MERGE_GROUP_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          # Determine comparison base
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            BASE_SHA="$PR_BASE_SHA"
+          elif [[ "$EVENT_NAME" == "merge_group" ]]; then
+            BASE_SHA="$MERGE_GROUP_BASE_SHA"
+          elif [[ "$EVENT_NAME" == "push" ]]; then
+            BASE_SHA="$PUSH_BEFORE_SHA"
+          else
+            echo "Manual trigger — always build"
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Initial push (all-zeros SHA) — always build
+          if [[ "$BASE_SHA" == "0000000000000000000000000000000000000000" ]]; then
+            echo "Initial push — always build"
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Unreachable base SHA (e.g. after force-push) — always build
+          if ! git cat-file -e "$BASE_SHA" 2>/dev/null; then
+            echo "Base SHA $BASE_SHA not reachable — always build"
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Three-dot (merge-base) diff, NOT two-dot. BASE_SHA is the base
+          # branch tip at event time, which may be ahead of where this branch
+          # forked. A two-dot "git diff BASE_SHA HEAD" would then report every
+          # commit the base branch gained since the fork as a phantom change on
+          # this branch, flagging unrelated code files and forcing a needless
+          # build on docs/workflow-only PRs that have fallen behind develop.
+          # The three-dot form scopes the diff to this branch's own commits.
+          CHANGED_FILES=$(git diff --name-only "$BASE_SHA...HEAD")
+
+          if [[ -z "$CHANGED_FILES" ]]; then
+            echo "No changed files detected — skipping build"
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Changed files:"
+          echo "$CHANGED_FILES"
+          echo ""
+
+          # Extract Maven module directories using Maven itself
+          set +e
+          MODULES=$(./mvnw -s .github/workflows/settings.xml -q help:evaluate \
+            -Dexpression=project.modules -DforceStdout -N \
+            | sed -n 's/.*<string>\(.*\)<\/string>.*/\1/p')
+          MVN_EXIT=$?
+          set -e
+
+          if [[ -z "$MODULES" ]]; then
+            echo "Failed to extract Maven modules (mvn exit code: $MVN_EXIT) — always build"
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Maven modules detected:"
+          echo "$MODULES"
+          echo ""
+
+          # A file is build-relevant when it is NOT a *.md file AND
+          # resides inside a Maven module directory or is a root build file.
+          SHOULD_BUILD=false
+          while IFS= read -r file; do
+            [[ -z "$file" ]] && continue
+
+            # Markdown files are never build-relevant
+            if [[ "$file" == *.md ]]; then
+              continue
+            fi
+
+            # Root build infrastructure
+            if [[ "$file" == pom.xml ]] || [[ "$file" == .mvn/* ]] || \
+               [[ "$file" == mvnw ]] || [[ "$file" == mvnw.cmd ]] || \
+               [[ "$file" == .github/workflows/* ]] || \
+               [[ "$file" == .idea/inspectionProfiles/* ]]; then
+              SHOULD_BUILD=true
+              echo "Build-relevant file found: $file"
+              break
+            fi
+
+            # Check if the file belongs to any Maven module
+            while IFS= read -r module; do
+              [[ -z "$module" ]] && continue
+              if [[ "$file" == "$module"/* ]]; then
+                SHOULD_BUILD=true
+                echo "Build-relevant file found: $file (module: $module)"
+                break 2
+              fi
+            done <<< "$MODULES"
+          done <<< "$CHANGED_FILES"
+
+          if [[ "$SHOULD_BUILD" == "false" ]]; then
+            echo "No build-relevant changes — skipping build"
+          fi
+
+          echo "should_build=$SHOULD_BUILD" >> "$GITHUB_OUTPUT"
+
+  test-linux:
+    name: Linux ${{ matrix.arch }} - JDK ${{ matrix.java }} - ${{ matrix.distribution }}
+    needs: [ detect-changes ]
+    if: needs.detect-changes.outputs.should_build == 'true'
+    runs-on: ${{ matrix.runs_on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        java: [ '21', '25' ]
+        distribution: [ 'temurin' ]
+        arch: [ 'x86', 'arm' ]
+        include:
+          - arch: x86
+            runs_on: [ self-hosted, type-cpx42, image-x86-system-ubuntu-24.04, in-nbg1-fsn1-hel1 ]
+            java_arch: x64
+            docker_platform: 'linux/amd64'
+            mvn_opts: '-Dmaven.test.failure.ignore=true -Dyoutrackdb.test.env=ci -P docker-images,coverage -Ddocker.platforms=linux/amd64'
+          - arch: arm
+            # GitHub-hosted runner (Hetzner ARM capacity is scarce). This runner
+            # is less potent than the Hetzner CAX nodes previously used, so two
+            # options from the old ARM command are intentionally dropped:
+            #   * -Dyoutrackdb.test.env=ci (disk-storage mode) — already
+            #     exercised on the x86 leg; disk-IO-heavy suites time out here.
+            #   * coverage profile — coverage is collected on x86 only.
+            # docker-images is kept for the arm64 image build.
+            runs_on: ubuntu-24.04-arm
+            java_arch: aarch64
+            docker_platform: 'linux/arm64/v8'
+            mvn_opts: '-Dmaven.test.failure.ignore=true -P docker-images -Ddocker.platforms=linux/arm64/v8'
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Set up JDK ${{ matrix.java }}
+        uses: actions/setup-java@v5
+        with:
+          java-version: ${{ matrix.java }}
+          distribution: ${{ matrix.distribution }}
+          architecture: ${{ matrix.java_arch }}
+          overwrite-settings: false
+      - name: Run Unit Tests
+        id: tests
+        run: ./mvnw -s .github/workflows/settings.xml clean package -B ${{ matrix.mvn_opts }}
+        env:
+          MAVEN_MIRROR_USERNAME: ${{ secrets.MAVEN_MIRROR_USERNAME }}
+          MAVEN_MIRROR_PASSWORD: ${{ secrets.MAVEN_MIRROR_PASSWORD }}
+      - name: Print VMLens Data Race Report
+        if: always()
+        run: |
+          REPORT_DIR="core/target/vmlens-report"
+          if [ -d "$REPORT_DIR" ]; then
+            echo "::group::VMLens Data Race Report"
+            echo "Report files:"
+            find "$REPORT_DIR" -type f | sort
+            echo ""
+            for f in "$REPORT_DIR"/*.html; do
+              [ -f "$f" ] || continue
+              echo "=== $(basename "$f") ==="
+              # Strip HTML tags for readable log output
+              sed 's/<[^>]*>//g; s/&nbsp;/ /g; s/&lt;/</g; s/&gt;/>/g; s/&amp;/\&/g' "$f" \
+                | sed '/^[[:space:]]*$/d'
+              echo ""
+            done
+            echo "::endgroup::"
+          else
+            echo "No VMLens report directory found at $REPORT_DIR"
+          fi
+      - name: Upload VMLens Report
+        uses: actions/upload-artifact@v7
+        if: "!cancelled()"
+        with:
+          name: vmlens-report-linux-${{ matrix.arch }}-jdk${{ matrix.java }}-${{ matrix.distribution }}
+          path: 'core/target/vmlens-report/'
+          if-no-files-found: ignore
+          retention-days: 30
+      - name: Publish Test Results
+        uses: EnricoMi/publish-unit-test-result-action@v2
+        if: always()
+        with:
+          files: |
+            **/target/surefire-reports/TEST-*.xml
+            **/target/failsafe-reports/TEST-*.xml
+          action_fail: true
+          large_files: true
+          comment_mode: off
+          compare_to_earlier_commit: false
+          check_name: Tests Results (Linux ${{ matrix.arch }}, JDK ${{ matrix.java }} - ${{ matrix.distribution }})
+      - name: Upload Test Diagnostics
+        uses: actions/upload-artifact@v7
+        if: "!cancelled()"
+        with:
+          name: test-diagnostics-linux-${{ matrix.arch }}-jdk${{ matrix.java }}-${{ matrix.distribution }}
+          path: |
+            **/target/deadlock-report.txt
+            **/target/surefire-reports/*.dumpstream
+            **/target/surefire-reports/*.dump
+          retention-days: 7
+          if-no-files-found: ignore
+      - name: Upload Coverage Data
+        uses: actions/upload-artifact@v7
+        if: "!cancelled() && matrix.arch == 'x86' && matrix.java == '21' && matrix.distribution == 'temurin'"
+        with:
+          name: coverage-data
+          path: '.coverage/reports/'
+          retention-days: 1
+          if-no-files-found: error
+      - name: Collect Test Counts
+        if: "!cancelled() && matrix.arch == 'x86' && matrix.java == '21' && matrix.distribution == 'temurin'"
+        run: python3 .github/scripts/collect-test-counts.py --output /tmp/test-counts.json
+      - name: Upload Test Counts
+        uses: actions/upload-artifact@v7
+        if: "!cancelled() && matrix.arch == 'x86' && matrix.java == '21' && matrix.distribution == 'temurin'"
+        with:
+          name: test-counts
+          path: /tmp/test-counts.json
+          retention-days: 1
+          if-no-files-found: error
+  test-windows:
+    name: Windows x64 - JDK ${{ matrix.java }} - ${{ matrix.distribution }}
+    needs: [ detect-changes ]
+    if: needs.detect-changes.outputs.should_build == 'true'
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        java: [ '21', '25' ]
+        distribution: [ 'temurin' ]
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Set up JDK ${{ matrix.java }}
+        uses: actions/setup-java@v5
+        with:
+          java-version: ${{ matrix.java }}
+          distribution: ${{ matrix.distribution }}
+          architecture: x64
+          cache: 'maven'
+          overwrite-settings: false
+      - name: Run Unit Tests
+        id: tests
+        shell: bash
+        run: ./mvnw -s .github/workflows/settings.xml clean package -B -Dmaven.test.failure.ignore=true
+        env:
+          MAVEN_MIRROR_USERNAME: ${{ secrets.MAVEN_MIRROR_USERNAME }}
+          MAVEN_MIRROR_PASSWORD: ${{ secrets.MAVEN_MIRROR_PASSWORD }}
+      - name: Publish Test Results
+        uses: EnricoMi/publish-unit-test-result-action/windows@v2
+        if: always()
+        with:
+          files: |
+            **/target/surefire-reports/TEST-*.xml
+            **/target/failsafe-reports/TEST-*.xml
+          action_fail: true
+          large_files: true
+          comment_mode: off
+          compare_to_earlier_commit: false
+          check_name: Tests Results (Windows x64, JDK ${{ matrix.java }} - ${{ matrix.distribution }})
+      - name: Upload Test Diagnostics
+        uses: actions/upload-artifact@v7
+        if: "!cancelled()"
+        with:
+          name: test-diagnostics-windows-jdk${{ matrix.java }}-${{ matrix.distribution }}
+          path: |
+            **/target/deadlock-report.txt
+            **/target/surefire-reports/*.dumpstream
+            **/target/surefire-reports/*.dump
+          retention-days: 7
+          if-no-files-found: ignore
+
+  test-macos:
+    name: macOS arm - JDK ${{ matrix.java }} - ${{ matrix.distribution }}
+    needs: [ detect-changes ]
+    if: needs.detect-changes.outputs.should_build == 'true'
+    # GitHub-hosted Apple Silicon runner. The docker-images profile is
+    # intentionally omitted — it builds linux/amd64 and linux/arm64
+    # images, which don't belong on a macOS runner. Otherwise options
+    # mirror the Windows leg (reduced, since the runner is less potent
+    # than the Hetzner CPX42 nodes).
+    #
+    # Non-blocking during soak period: this job is excluded from the
+    # needs: of save-test-counts and the ci-status blocking check, so a
+    # macOS failure does not block the build. The notify-failure/
+    # notify-fixed jobs still observe it so the team sees macOS
+    # regressions. Promote to blocking once the leg is proven stable on
+    # develop.
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        java: [ '21', '25' ]
+        distribution: [ 'temurin' ]
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Set up JDK ${{ matrix.java }}
+        uses: actions/setup-java@v5
+        with:
+          java-version: ${{ matrix.java }}
+          distribution: ${{ matrix.distribution }}
+          architecture: aarch64
+          cache: 'maven'
+          overwrite-settings: false
+      - name: Run Unit Tests
+        id: tests
+        run: ./mvnw -s .github/workflows/settings.xml clean package -B -Dmaven.test.failure.ignore=true
+        env:
+          MAVEN_MIRROR_USERNAME: ${{ secrets.MAVEN_MIRROR_USERNAME }}
+          MAVEN_MIRROR_PASSWORD: ${{ secrets.MAVEN_MIRROR_PASSWORD }}
+      - name: Publish Test Results
+        uses: EnricoMi/publish-unit-test-result-action/macos@v2
+        if: always()
+        with:
+          files: |
+            **/target/surefire-reports/TEST-*.xml
+            **/target/failsafe-reports/TEST-*.xml
+          action_fail: true
+          large_files: true
+          comment_mode: off
+          compare_to_earlier_commit: false
+          check_name: Tests Results (macOS arm, JDK ${{ matrix.java }} - ${{ matrix.distribution }})
+      - name: Upload Test Diagnostics
+        uses: actions/upload-artifact@v7
+        if: "!cancelled()"
+        with:
+          name: test-diagnostics-macos-jdk${{ matrix.java }}-${{ matrix.distribution }}
+          path: |
+            **/target/deadlock-report.txt
+            **/target/surefire-reports/*.dumpstream
+            **/target/surefire-reports/*.dump
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # ------------------------------------------------------------------
+  # JOB: SMALL CACHE INTEGRATION TESTS (advisory, not in ci-status gate)
+  # Runs StorageComponent ITs with 4 MB disk cache to exercise
+  # optimistic read fallback under heavy eviction pressure.
+  # ------------------------------------------------------------------
+  test-small-cache-linux:
+    name: Small Cache IT (Linux x86)
+    needs: [ detect-changes ]
+    if: >-
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/develop' &&
+      needs.detect-changes.outputs.should_build == 'true'
+    runs-on:
+      - self-hosted
+      - in-nbg1
+      - type-cpx42
+      - image-x86-system-ubuntu-24.04
+      - volume-cache
+    timeout-minutes: 120
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Set up JDK 21
+        uses: actions/setup-java@v5
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          architecture: x64
+          overwrite-settings: false
+      - name: Run Small Cache Integration Tests
+        run: ./mvnw -s .github/workflows/settings.xml -pl core -am clean verify -P small-cache-it -Dmaven.test.failure.ignore=true -B
+        env:
+          MAVEN_MIRROR_USERNAME: ${{ secrets.MAVEN_MIRROR_USERNAME }}
+          MAVEN_MIRROR_PASSWORD: ${{ secrets.MAVEN_MIRROR_PASSWORD }}
+      - name: Publish Test Results
+        uses: EnricoMi/publish-unit-test-result-action@v2
+        if: always()
+        with:
+          files: 'core/target/failsafe-reports/TEST-*.xml'
+          action_fail: true
+          large_files: true
+          comment_mode: off
+          compare_to_earlier_commit: false
+          check_name: Tests Results (Small Cache IT)
+      - name: Upload Test Diagnostics
+        uses: actions/upload-artifact@v7
+        if: "!cancelled()"
+        with:
+          name: test-diagnostics-small-cache-linux
+          path: |
+            **/target/deadlock-report.txt
+            **/target/failsafe-reports/*.dumpstream
+            **/target/failsafe-reports/*.dump
+          retention-days: 7
+          if-no-files-found: ignore
+      # Inline dispatch (single non-matrix job, no dedicated notify-failure job needed)
+      - name: Dispatch CI Fix Agent
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.CI_FIX_AGENT_TOKEN }}
+          FAILED_RUN_URL: "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          FAILED_WORKFLOW_NAME: ${{ github.workflow }}
+          TRIGGER_SHA: ${{ github.sha }}
+        run: |
+          gh workflow run ci-failure-fix-agent.yml \
+            --repo "${{ github.repository }}" \
+            -f failed_run_url="$FAILED_RUN_URL" \
+            -f failed_workflow_name="$FAILED_WORKFLOW_NAME" \
+            -f trigger_sha="$TRIGGER_SHA"
+      - name: Send Zulip notification on failure
+        if: failure()
+        uses: zulip/github-actions-zulip/send-message@v2
+        with:
+          api-key: ${{ secrets.ZULIP_API_KEY }}
+          email: ci-status-bot@youtrackdb.zulipchat.com
+          organization-url: 'https://youtrackdb.zulipchat.com'
+          to: 'ytdb'
+          type: 'stream'
+          topic: 'ci status'
+          content: |
+            **SMALL CACHE IT FAILED** :rotating_light:
+            Small cache integration tests failed on `${{ github.head_ref || github.ref_name }}` for commit ${{ github.sha }}.
+            [View Run Logs](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+
+  # ------------------------------------------------------------------
+  # JOB 3: COVERAGE GATE
+  # Enforces line & branch coverage thresholds on new/changed code
+  # Thresholds: 85% line coverage, 70% branch coverage (all PRs)
+  # ------------------------------------------------------------------
+  coverage-gate:
+    name: Coverage Gate (New Code)
+    needs: [ test-linux ]
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: write
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Download Coverage Data
+        uses: actions/download-artifact@v8
+        with:
+          name: coverage-data
+          path: .coverage/reports
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Run Coverage Gate
+        id: gate
+        continue-on-error: true
+        run: |
+          python3 .github/scripts/coverage-gate.py \
+            --line-threshold 85 \
+            --branch-threshold 70 \
+            --compare-branch "origin/${{ github.event.pull_request.base.ref }}" \
+            --coverage-dir .coverage/reports \
+            --output-md /tmp/coverage-gate.md
+
+      - name: Post Coverage Gate Comment
+        if: always() && steps.gate.outcome != 'cancelled'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ ! -f /tmp/coverage-gate.md ]; then
+            echo "No markdown report generated. Skipping comment."
+            exit 0
+          fi
+
+          PR_NUMBER=${{ github.event.pull_request.number }}
+          REPO=${{ github.repository }}
+          MARKER="<!-- coverage-gate-comment -->"
+
+          # Find existing comment with our marker
+          COMMENT_ID=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+            --paginate --jq ".[] | select(.body | contains(\"${MARKER}\")) | .id" \
+            | head -n1)
+
+          BODY=$(jq -Rs '.' < /tmp/coverage-gate.md)
+
+          if [ -n "$COMMENT_ID" ]; then
+            echo "Updating existing comment ${COMMENT_ID}"
+            gh api "repos/${REPO}/issues/comments/${COMMENT_ID}" \
+              -X PATCH \
+              --input <(jq -n --argjson body "$BODY" '{"body": $body}')
+          else
+            echo "Creating new comment"
+            gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+              -X POST \
+              --input <(jq -n --argjson body "$BODY" '{"body": $body}')
+          fi
+
+      - name: Enforce Coverage Gate
+        if: always() && steps.gate.outcome == 'failure'
+        run: |
+          echo "Coverage gate failed. See the PR comment for details."
+          exit 1
+
+  # ------------------------------------------------------------------
+  # JOB 4: TEST COUNT GATE
+  # Detects unintentional test removal or disabling by comparing
+  # current test counts against the develop baseline (stored in git
+  # notes). Allows a configurable tolerance (default 5% per module).
+  # Bypassed when PR title contains [no-test-number-check].
+  # ------------------------------------------------------------------
+  test-count-gate:
+    name: Test Count Gate
+    needs: [ test-linux ]
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: write
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Check PR Title for Bypass
+        id: bypass
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          if [[ "$PR_TITLE" == *"[no-test-number-check]"* ]]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "PR title contains [no-test-number-check] — gate will be bypassed"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download Test Counts
+        uses: actions/download-artifact@v8
+        with:
+          name: test-counts
+          path: /tmp/test-counts
+
+      - name: Fetch Baseline from Git Notes
+        if: steps.bypass.outputs.skip != 'true'
+        id: baseline
+        run: |
+          if git fetch origin refs/notes/test-counts:refs/notes/test-counts 2>/dev/null; then
+            DEVELOP_SHA=$(git rev-parse origin/develop)
+            if git notes --ref=test-counts show "$DEVELOP_SHA" > /tmp/test-counts-baseline.json 2>/dev/null; then
+              echo "Loaded baseline from git notes for develop ($DEVELOP_SHA)"
+              echo "found=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "No git note found for develop HEAD ($DEVELOP_SHA)"
+              echo "found=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "No test-counts notes ref found"
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Run Test Count Gate
+        id: gate
+        continue-on-error: true
+        run: |
+          ARGS=(
+            --baseline /tmp/test-counts-baseline.json
+            --current /tmp/test-counts/test-counts.json
+            --tolerance 5
+            --output-md /tmp/test-count-gate.md
+          )
+          if [[ "${{ steps.bypass.outputs.skip }}" == "true" ]]; then
+            ARGS+=(--skip)
+          fi
+
+          python3 .github/scripts/test-count-gate.py "${ARGS[@]}"
+
+      - name: Post Test Count Gate Comment
+        if: always() && steps.gate.outcome != 'cancelled'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ ! -f /tmp/test-count-gate.md ]; then
+            echo "No markdown report generated. Skipping comment."
+            exit 0
+          fi
+
+          PR_NUMBER=${{ github.event.pull_request.number }}
+          REPO=${{ github.repository }}
+          MARKER="<!-- test-count-gate-comment -->"
+
+          COMMENT_ID=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+            --paginate --jq ".[] | select(.body | contains(\"${MARKER}\")) | .id" \
+            | head -n1)
+
+          BODY=$(jq -Rs '.' < /tmp/test-count-gate.md)
+
+          if [ -n "$COMMENT_ID" ]; then
+            echo "Updating existing comment ${COMMENT_ID}"
+            gh api "repos/${REPO}/issues/comments/${COMMENT_ID}" \
+              -X PATCH \
+              --input <(jq -n --argjson body "$BODY" '{"body": $body}')
+          else
+            echo "Creating new comment"
+            gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+              -X POST \
+              --input <(jq -n --argjson body "$BODY" '{"body": $body}')
+          fi
+
+      - name: Enforce Test Count Gate
+        if: always() && steps.gate.outcome == 'failure'
+        run: |
+          echo "Test count gate failed. See the PR comment for details."
+          exit 1
+
+  # ------------------------------------------------------------------
+  # JOB 5: SAVE TEST COUNT BASELINE
+  # On develop pushes, saves current test counts to git notes so that
+  # future PRs can compare against the latest develop baseline.
+  # ------------------------------------------------------------------
+  save-test-counts:
+    name: Save Test Count Baseline
+    # test-macos intentionally excluded: non-blocking during soak period.
+    needs: [ detect-changes, test-linux, test-windows ]
+    if: >-
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/develop' &&
+      needs.detect-changes.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Download Test Counts
+        uses: actions/download-artifact@v8
+        with:
+          name: test-counts
+          path: /tmp/test-counts
+
+      - name: Save to Git Notes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin refs/notes/test-counts:refs/notes/test-counts 2>/dev/null || true
+          git notes --ref=test-counts add -f \
+            -F /tmp/test-counts/test-counts.json HEAD
+          git push origin refs/notes/test-counts
+
+          echo "Saved test counts to git notes for $(git rev-parse --short HEAD):"
+          cat /tmp/test-counts/test-counts.json
+
+  # ------------------------------------------------------------------
+  # GATE JOB: CI STATUS
+  # Always runs — reports success when build is skipped or all jobs pass.
+  # Configure this as the single required status check in branch protection.
+  # ------------------------------------------------------------------
+  ci-status:
+    name: CI Status
+    if: always() && github.event.pull_request.draft != true
+    needs: [ detect-changes, test-linux, test-windows, test-macos, coverage-gate, test-count-gate ]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v6
+
+      - name: Verify embedded code examples in documentation
+        run: npx embedme --verify **/*.md
+
+      # Fold workflow TOC + annotation validation into the required CI Status
+      # gate. The standalone `workflow-toc-check.yml` workflow gives fast,
+      # path-filtered PR feedback, but it is not a required status check, so a
+      # red TOC check there cannot block a merge (this is how a schema
+      # violation reached develop unblocked). Running `--check` here makes a
+      # violation fail CI Status — the blocking gate — on pull requests and on
+      # develop pushes alike. The check is stdlib-only and finishes in ~1s, and
+      # it runs before the should_build early-exit below so it also covers
+      # workflow-only PRs that skip the build matrix.
+      - name: Validate workflow TOC + annotations
+        run: python3 .claude/scripts/workflow-reindex.py --check
+
+      - name: Check results
+        env:
+          DETECT_RESULT: ${{ needs.detect-changes.result }}
+          SHOULD_BUILD: ${{ needs.detect-changes.outputs.should_build }}
+          LINUX_RESULT: ${{ needs.test-linux.result }}
+          WINDOWS_RESULT: ${{ needs.test-windows.result }}
+          MACOS_RESULT: ${{ needs.test-macos.result }}
+          COVERAGE_RESULT: ${{ needs.coverage-gate.result }}
+          TEST_COUNT_RESULT: ${{ needs.test-count-gate.result }}
+        run: |
+          if [[ "$DETECT_RESULT" != "success" ]]; then
+            echo "detect-changes job did not succeed (result: $DETECT_RESULT)"
+            exit 1
+          fi
+          if [[ "$SHOULD_BUILD" == "false" ]]; then
+            echo "Build skipped — no relevant changes"
+            exit 0
+          fi
+          # macOS is non-blocking during soak period: we wait for it
+          # (it's in needs:) and log its result, but do not fail
+          # ci-status on a macOS-only regression. The notify-failure
+          # job observes test-macos separately and still alerts.
+          echo "macOS result (non-blocking during soak): $MACOS_RESULT"
+          if [[ "$LINUX_RESULT" != "success" ]] || \
+             [[ "$WINDOWS_RESULT" != "success" ]]; then
+            echo "Not all required jobs succeeded" \
+              "(linux=$LINUX_RESULT, windows=$WINDOWS_RESULT)"
+            exit 1
+          fi
+          # coverage-gate and test-count-gate only run on PRs;
+          # on push events their result is "skipped", which is acceptable.
+          if [[ "$COVERAGE_RESULT" != "success" && "$COVERAGE_RESULT" != "skipped" ]]; then
+            echo "Coverage gate did not succeed (result: $COVERAGE_RESULT)"
+            exit 1
+          fi
+          if [[ "$TEST_COUNT_RESULT" != "success" && "$TEST_COUNT_RESULT" != "skipped" ]]; then
+            echo "Test count gate did not succeed (result: $TEST_COUNT_RESULT)"
+            exit 1
+          fi
+          echo "All required jobs passed"
+
+  notify-failure:
+    name: Notify build failure on Zulip
+    needs: [ detect-changes, test-linux, test-windows, test-macos ]
+    if: >-
+      failure() &&
+      needs.detect-changes.outputs.should_build == 'true' &&
+      github.event_name == 'push' &&
+      contains(fromJSON(vars.MAIN_BRANCHES), github.ref_name)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Determine Branch Name
+        id: branch_name
+        run: echo "branch=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+      - name: Dispatch CI Fix Agent
+        if: github.ref_name == 'develop'
+        env:
+          GH_TOKEN: ${{ secrets.CI_FIX_AGENT_TOKEN }}
+        run: |
+          gh workflow run ci-failure-fix-agent.yml \
+            --repo "${{ github.repository }}" \
+            -f failed_run_url="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            -f failed_workflow_name="${{ github.workflow }}" \
+            -f trigger_sha="${{ github.sha }}"
+      - name: Send Zulip notification
+        uses: zulip/github-actions-zulip/send-message@v2
+        with:
+          api-key: ${{ secrets.ZULIP_API_KEY }}
+          email: ci-status-bot@youtrackdb.zulipchat.com
+          organization-url: 'https://youtrackdb.zulipchat.com'
+          to: 'ytdb'
+          type: 'stream'
+          topic: 'ci status'
+          content: |
+            **BUILD FAILED** :rotating_light:
+            Build failed on branch `${{ steps.branch_name.outputs.branch }}` for commit ${{ github.sha }} for repo ${{ github.repository }}.
+            [View Run Logs](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+            :robot: Automated fix agent has been dispatched and is investigating...
+  notify-fixed:
+    name: Notify build fixed on Zulip
+    # test-macos intentionally excluded during soak: a "fixed" signal should
+    # fire when Linux/Windows recover even if macOS is still flaky.
+    needs: [ detect-changes, test-linux, test-windows ]
+    if: >-
+      always() &&
+      needs.detect-changes.outputs.should_build == 'true' &&
+      !contains(needs.*.result, 'failure') &&
+      !contains(needs.*.result, 'cancelled') &&
+      github.event_name == 'push' &&
+      contains(fromJSON(vars.MAIN_BRANCHES), github.ref_name)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v6
+
+      - name: Determine Branch Name
+        id: branch_name
+        run: echo "branch=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+
+      - name: Get Previous Run Status
+        id: previous_run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          previous_conclusion=$(gh run list \
+            --repo "${{ github.repository }}" \
+            --branch "${{ steps.branch_name.outputs.branch }}" \
+            --workflow "${{ github.workflow }}" \
+            --limit 2 \
+            --json conclusion \
+            --jq '.[1].conclusion')
+          echo "previous_conclusion=$previous_conclusion" >> $GITHUB_OUTPUT
+
+      - name: Send Zulip notification
+        if: steps.previous_run.outputs.previous_conclusion == 'failure'
+        uses: zulip/github-actions-zulip/send-message@v2
+        with:
+          api-key: ${{ secrets.ZULIP_API_KEY }}
+          email: ci-status-bot@youtrackdb.zulipchat.com
+          organization-url: 'https://youtrackdb.zulipchat.com'
+          to: 'ytdb'
+          type: 'stream'
+          topic: 'ci status'
+          content: |
+            **BUILD FIXED** :white_check_mark:
+            Build fixed on branch `${{ steps.branch_name.outputs.branch }}` for commit ${{ github.sha }} for repo ${{ github.repository }}.
+            [View Run Logs](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})

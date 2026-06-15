@@ -1,0 +1,116 @@
+apiVersion: 1
+
+# Regression detection has moved to jmh-ldbc/jmh-regression-alert.py, invoked
+# from the nightly benchmark workflow. That path runs against the JSON the
+# benchmark just produced, has unit tests, and fails the workflow loudly if it
+# crashes — avoiding the silent "alert rule with buggy math returns OK" class
+# of failure that used to live here.
+#
+# Grafana keeps one job only: a liveness probe. If the Python alerter stops
+# running (workflow disabled, runner dead, secret rotated, etc.), the Python
+# path cannot alert on its own absence. This rule does.
+
+groups:
+  - orgId: 1
+    name: jmh-benchmark-freshness
+    folder: JMH Alerts
+    interval: 1h
+    rules:
+      # Fires when the most recent jmh_benchmark point on `develop` is older
+      # than 36 hours. Nightly benchmarks run every 24h, so a 36h threshold
+      # tolerates one missed run before paging (avoids noise from routine
+      # single-night glitches) while still catching a pipeline that has
+      # genuinely stopped producing data.
+      - uid: jmh-data-freshness
+        title: "JMH benchmark pipeline stalled (no fresh data)"
+        condition: C
+        for: 0s
+        annotations:
+          # Use $values.A.Value (the reduced scalar) rather than $values.B.Value
+          # (the raw query series). Refid A is the single value that refId C's
+          # threshold actually compares against, so the annotation stays
+          # consistent with the firing decision even if B's shape changes.
+          summary: >-
+            No JMH benchmark data for {{ printf "%.1f" $values.A.Value }}h
+            on branch `develop` — the nightly pipeline may be broken.
+          description: >-
+            The freshest jmh_benchmark point on develop is older than 36h.
+            This usually means the nightly workflow failed, was disabled,
+            or the self-hosted runner is offline. Regression detection
+            relies on fresh data — investigate before more nights pass.
+          dashboard_url: https://bench.youtrackdb.io
+        labels:
+          severity: warning
+        # If the bucket has no data in the last 7 days at all, treat it as a
+        # firing condition: a completely empty history is worse than stale.
+        noDataState: Alerting
+        execErrState: Alerting
+        data:
+          - refId: B
+            relativeTimeRange:
+              from: 604800  # 7 days in seconds
+              to: 0
+            datasourceUid: "P951FEA4DE68E13C5"
+            model:
+              refId: B
+              datasource:
+                type: influxdb
+                uid: "P951FEA4DE68E13C5"
+              query: |
+                from(bucket: "jmh-benchmarks")
+                  |> range(start: -7d)
+                  |> filter(fn: (r) => r._measurement == "jmh_benchmark")
+                  |> filter(fn: (r) => r._field == "score")
+                  |> filter(fn: (r) => r.branch == "develop")
+                  |> group()
+                  |> last()
+                  |> map(fn: (r) => ({
+                    _time: now(),
+                    _value: float(v: int(v: now()) - int(v: r._time))
+                            / 3600000000000.0,
+                  }))
+                  |> keep(columns: ["_time", "_value"])
+          # `reduce` collapses refId B's output (one row with the age in hours)
+          # into a single scalar for the threshold step to compare against.
+          # No `conditions:` block here: the firing decision is made by
+          # refId C (the threshold step below), not by this reducer.
+          - refId: A
+            relativeTimeRange:
+              from: 604800
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: A
+              type: reduce
+              datasource:
+                type: __expr__
+                uid: __expr__
+              expression: B
+              reducer: last
+              settings:
+                mode: ""
+          # Fire if age_hours > 36
+          - refId: C
+            relativeTimeRange:
+              from: 604800
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              datasource:
+                type: __expr__
+                uid: __expr__
+              conditions:
+                - evaluator:
+                    params:
+                      - 36
+                    type: gt
+                  operator:
+                    type: and
+                  query:
+                    params:
+                      - C
+                  reducer:
+                    type: last
+              expression: A

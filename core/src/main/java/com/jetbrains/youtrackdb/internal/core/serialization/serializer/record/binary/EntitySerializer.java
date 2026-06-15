@@ -1,0 +1,103 @@
+/*
+ *
+ *
+ *  *
+ *  *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  *  you may not use this file except in compliance with the License.
+ *  *  You may obtain a copy of the License at
+ *  *
+ *  *       http://www.apache.org/licenses/LICENSE-2.0
+ *  *
+ *  *  Unless required by applicable law or agreed to in writing, software
+ *  *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  *  See the License for the specific language governing permissions and
+ *  *  limitations under the License.
+ *  *
+ *
+ *
+ */
+
+package com.jetbrains.youtrackdb.internal.core.serialization.serializer.record.binary;
+
+import com.jetbrains.youtrackdb.internal.core.db.DatabaseSessionEmbedded;
+import com.jetbrains.youtrackdb.internal.core.db.record.RecordElement;
+import com.jetbrains.youtrackdb.internal.core.metadata.schema.ImmutableSchema;
+import com.jetbrains.youtrackdb.internal.core.metadata.schema.PropertyTypeInternal;
+import com.jetbrains.youtrackdb.internal.core.metadata.schema.schema.SchemaClass;
+import com.jetbrains.youtrackdb.internal.core.metadata.security.PropertyEncryption;
+import com.jetbrains.youtrackdb.internal.core.record.impl.EntityImpl;
+
+public interface EntitySerializer {
+
+  void serialize(DatabaseSessionEmbedded session, EntityImpl entity, BytesContainer bytes);
+
+  int serializeValue(
+      DatabaseSessionEmbedded db, BytesContainer bytes,
+      Object value,
+      PropertyTypeInternal type,
+      PropertyTypeInternal linkedType,
+      ImmutableSchema schema,
+      PropertyEncryption encryption);
+
+  void deserialize(DatabaseSessionEmbedded db, EntityImpl entity, BytesContainer bytes);
+
+  default void deserialize(DatabaseSessionEmbedded db, EntityImpl entity,
+      ReadBytesContainer bytes) {
+    throw new UnsupportedOperationException(
+        "ReadBytesContainer deserialization not supported by " + getClass().getSimpleName());
+  }
+
+  void deserializePartial(DatabaseSessionEmbedded db, EntityImpl entity, BytesContainer bytes,
+      String[] iFields);
+
+  default void deserializePartial(DatabaseSessionEmbedded db, EntityImpl entity,
+      ReadBytesContainer bytes, String[] iFields) {
+    throw new UnsupportedOperationException(
+        "ReadBytesContainer deserialization not supported by " + getClass().getSimpleName());
+  }
+
+  Object deserializeValue(DatabaseSessionEmbedded db, BytesContainer bytes,
+      PropertyTypeInternal type,
+      RecordElement owner);
+
+  BinaryField deserializeField(
+      DatabaseSessionEmbedded db, BytesContainer bytes,
+      SchemaClass iClass,
+      String iFieldName,
+      boolean embedded,
+      ImmutableSchema schema,
+      PropertyEncryption encryption);
+
+  /**
+   * Locates a field in the serialized record for in-place comparison.
+   *
+   * @param fieldNameBytes pre-computed UTF-8 bytes of iFieldName (avoids per-call allocation
+   *                       when the caller invokes this method repeatedly for the same field)
+   */
+  default ReadBinaryField deserializeField(
+      DatabaseSessionEmbedded db, ReadBytesContainer bytes,
+      SchemaClass iClass,
+      String iFieldName,
+      byte[] fieldNameBytes,
+      boolean embedded,
+      ImmutableSchema schema,
+      PropertyEncryption encryption) {
+    throw new UnsupportedOperationException(
+        "ReadBytesContainer deserializeField not supported by "
+            + getClass().getSimpleName());
+  }
+
+  BinaryComparator getComparator();
+
+  /**
+   * Returns the array of field names with no values.
+   *
+   * @param session   the active database session
+   * @param reference the entity whose serialized bytes are being read
+   * @param iBytes    the byte container holding the serialized entity data
+   * @param embedded  true if the entity is serialized in embedded mode
+   */
+  String[] getFieldNames(DatabaseSessionEmbedded session, EntityImpl reference,
+      BytesContainer iBytes, boolean embedded);
+}

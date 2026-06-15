@@ -1,0 +1,1855 @@
+/*
+ *
+ *
+ *  *
+ *  *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  *  you may not use this file except in compliance with the License.
+ *  *  You may obtain a copy of the License at
+ *  *
+ *  *       http://www.apache.org/licenses/LICENSE-2.0
+ *  *
+ *  *  Unless required by applicable law or agreed to in writing, software
+ *  *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  *  See the License for the specific language governing permissions and
+ *  *  limitations under the License.
+ *  *
+ *
+ *
+ */
+
+package com.jetbrains.youtrackdb.internal.core.tx;
+
+import com.jetbrains.youtrackdb.api.exception.RecordNotFoundException;
+import com.jetbrains.youtrackdb.internal.common.log.LogManager;
+import com.jetbrains.youtrackdb.internal.common.profiler.monitoring.QueryMonitoringMode;
+import com.jetbrains.youtrackdb.internal.common.profiler.monitoring.TransactionMetricsListener;
+import com.jetbrains.youtrackdb.internal.core.YouTrackDBEnginesManager;
+import com.jetbrains.youtrackdb.internal.core.db.DatabaseSessionEmbedded;
+import com.jetbrains.youtrackdb.internal.core.db.record.RecordOperation;
+import com.jetbrains.youtrackdb.internal.core.db.record.record.Blob;
+import com.jetbrains.youtrackdb.internal.core.db.record.record.DBRecord;
+import com.jetbrains.youtrackdb.internal.core.db.record.record.Edge;
+import com.jetbrains.youtrackdb.internal.core.db.record.record.EmbeddedEntity;
+import com.jetbrains.youtrackdb.internal.core.db.record.record.Entity;
+import com.jetbrains.youtrackdb.internal.core.db.record.record.Identifiable;
+import com.jetbrains.youtrackdb.internal.core.db.record.record.RID;
+import com.jetbrains.youtrackdb.internal.core.db.record.record.Vertex;
+import com.jetbrains.youtrackdb.internal.core.exception.BaseException;
+import com.jetbrains.youtrackdb.internal.core.exception.CommandExecutionException;
+import com.jetbrains.youtrackdb.internal.core.exception.CommandSQLParsingException;
+import com.jetbrains.youtrackdb.internal.core.exception.CommandScriptException;
+import com.jetbrains.youtrackdb.internal.core.exception.DatabaseException;
+import com.jetbrains.youtrackdb.internal.core.exception.TransactionException;
+import com.jetbrains.youtrackdb.internal.core.id.ChangeableIdentity;
+import com.jetbrains.youtrackdb.internal.core.id.ChangeableRecordId;
+import com.jetbrains.youtrackdb.internal.core.id.IdentityChangeListener;
+import com.jetbrains.youtrackdb.internal.core.id.RecordIdInternal;
+import com.jetbrains.youtrackdb.internal.core.index.ClassIndexManager;
+import com.jetbrains.youtrackdb.internal.core.index.CompositeKey;
+import com.jetbrains.youtrackdb.internal.core.index.Index;
+import com.jetbrains.youtrackdb.internal.core.metadata.schema.PropertyTypeInternal;
+import com.jetbrains.youtrackdb.internal.core.metadata.schema.schema.SchemaClass;
+import com.jetbrains.youtrackdb.internal.core.metadata.security.Role;
+import com.jetbrains.youtrackdb.internal.core.metadata.security.Rule;
+import com.jetbrains.youtrackdb.internal.core.query.ResultSet;
+import com.jetbrains.youtrackdb.internal.core.record.RecordAbstract;
+import com.jetbrains.youtrackdb.internal.core.record.impl.EntityImpl;
+import com.jetbrains.youtrackdb.internal.core.serialization.serializer.record.RecordSerializer;
+import com.jetbrains.youtrackdb.internal.core.storage.impl.local.AbstractStorage;
+import com.jetbrains.youtrackdb.internal.core.storage.impl.local.paginated.RecordSerializationContext;
+import com.jetbrains.youtrackdb.internal.core.storage.impl.local.paginated.atomicoperations.AtomicOperation;
+import com.jetbrains.youtrackdb.internal.core.tx.FrontendTransactionIndexChanges.OPERATION;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.IdentityHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.TreeSet;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.stream.Stream;
+import javax.annotation.Nonnull;
+import javax.annotation.Nullable;
+
+public class FrontendTransactionImpl implements
+    IdentityChangeListener, FrontendTransaction {
+
+  @Nonnull
+  protected DatabaseSessionEmbedded session;
+  protected TXSTATUS status = TXSTATUS.INVALID;
+
+  protected final HashMap<RecordIdInternal, RecordOperation> recordOperations = new HashMap<>();
+  private final IdentityHashMap<RecordIdInternal, RecordOperation> recordOperationsIdentityMap =
+      new IdentityHashMap<>();
+  protected final TreeSet<RecordIdInternal> recordsInTransaction = new TreeSet<>();
+
+  protected final HashMap<RecordIdInternal, RecordOperation> operationsBetweenCallbacks =
+      new HashMap<>();
+  private final IdentityHashMap<RecordIdInternal,
+      RecordOperation> operationsBetweenCallbacksIdentityMap =
+          new IdentityHashMap<>();
+  private final ArrayList<RecordOperation> operationsForCallbackIteration = new ArrayList<>();
+
+  protected HashMap<RecordIdInternal,
+      List<FrontendTransactionRecordIndexOperation>> recordIndexOperations =
+          new HashMap<>();
+  private final IdentityHashMap<RecordIdInternal,
+      List<FrontendTransactionRecordIndexOperation>> recordIndexOperationsIdentityMap =
+          new IdentityHashMap<>();
+
+  protected HashMap<String, FrontendTransactionIndexChanges> indexEntries = new HashMap<>();
+
+  protected final HashMap<RecordIdInternal, RecordIdInternal> originalChangedRecordIdMap =
+      new HashMap<>();
+
+  protected long id;
+  protected int newRecordsPositionsGenerator = -2;
+  private final HashMap<String, Object> userData = new HashMap<>();
+
+  private boolean callbacksInProgress = false;
+  private boolean beforeCallBacksInProgress = false;
+
+  protected int txStartCounter;
+  private final boolean readOnly;
+
+  private final RecordSerializationContext recordSerializationContext =
+      new RecordSerializationContext();
+  private AtomicOperation atomicOperation;
+
+  // Thread that called startStorageTx() and incremented the per-thread activeTxCount.
+  // Pool shutdown may close a session from a different thread than the one that began the tx;
+  // in that case tsMin belongs to the originating thread's TsMinHolder and must not be reset.
+  private long storageTxThreadId;
+
+  /**
+   * Asserts that the current thread is the one that started this transaction. All transactional
+   * operations (begin, commit, read, write, delete) must happen on the originating thread.
+   *
+   * <p>Excluded from this check: {@link #close()} and {@link #rollbackInternal()}, which may
+   * be called cross-thread during pool shutdown ({@code DatabaseSessionEmbeddedPooled.realClose}).
+   */
+  private void assertOnOwningThread() {
+    assert storageTxThreadId == 0
+        || storageTxThreadId == Thread.currentThread().threadId()
+        : "Transaction used from thread " + Thread.currentThread().threadId()
+            + " but was started on thread " + storageTxThreadId;
+  }
+
+  public FrontendTransactionImpl(final DatabaseSessionEmbedded iDatabase) {
+    this(iDatabase, false);
+  }
+
+  public FrontendTransactionImpl(@Nonnull final DatabaseSessionEmbedded session, boolean readOnly) {
+    this.session = session;
+    this.id = ThreadLocalRandom.current().nextLong(Long.MAX_VALUE);
+    this.readOnly = readOnly;
+  }
+
+  public FrontendTransactionImpl(@Nonnull final DatabaseSessionEmbedded session, long txId,
+      boolean readOnly) {
+    this.session = session;
+    this.id = txId;
+    this.readOnly = readOnly;
+  }
+
+  protected FrontendTransactionImpl(@Nonnull final DatabaseSessionEmbedded session, long id) {
+    this.session = session;
+    this.id = id;
+    readOnly = false;
+  }
+
+  @Override
+  public int beginInternal() {
+    assertOnOwningThread();
+    if (txStartCounter < 0) {
+      throw new TransactionException(session, "Invalid value of TX counter: " + txStartCounter);
+    }
+    if (callbacksInProgress) {
+      throw new TransactionException(session,
+          "Callback processing is in progress. Cannot start a new transaction.");
+    }
+
+    if (txStartCounter == 0) {
+      status = TXSTATUS.BEGUN;
+
+      session.transactionMeters()
+          .totalTransactions()
+          .record();
+      var localCache = session.getLocalCache();
+      localCache.unloadNotModifiedRecords();
+      localCache.clear();
+
+      var storage = session.getStorage();
+      atomicOperation = storage.startStorageTx();
+      storageTxThreadId = Thread.currentThread().threadId();
+    } else {
+      if (status == TXSTATUS.ROLLED_BACK || status == TXSTATUS.ROLLBACKING) {
+        throw new RollbackException(
+            "Impossible to start a new transaction because the current was rolled back");
+      }
+    }
+
+    txStartCounter++;
+
+    assert status == TXSTATUS.BEGUN
+        : "Transaction status must be BEGUN after beginInternal, but was " + status;
+    assert txStartCounter > 0
+        : "txStartCounter must be positive after begin, but was " + txStartCounter;
+    assert atomicOperation != null
+        : "atomicOperation must be initialized after begin";
+
+    return txStartCounter;
+  }
+
+  @Override
+  public Map<RID, RID> commitInternal() {
+    return commitInternalImpl(null, null, null);
+  }
+
+  @Override
+  public Map<RID, RID> monitoredCommitInternal(
+      @Nonnull TransactionMetricsListener listener,
+      @Nonnull QueryMonitoringMode mode,
+      @Nonnull String trackingId) {
+    return commitInternalImpl(listener, mode, trackingId);
+  }
+
+  private Map<RID, RID> commitInternalImpl(
+      @Nullable TransactionMetricsListener listener,
+      @Nullable QueryMonitoringMode mode,
+      @Nullable String trackingId) {
+
+    assertOnOwningThread();
+    checkTransactionValid();
+
+    if (txStartCounter < 0) {
+      throw new TransactionException(session.getDatabaseName(),
+          "Invalid value of tx counter: " + txStartCounter);
+    }
+    if (txStartCounter == 1) {
+      preProcessRecordsAndExecuteCallCallbacks();
+    }
+    txStartCounter--;
+
+    if (txStartCounter == 0) {
+      return doCommit(listener, mode, trackingId);
+    } else {
+      if (txStartCounter < 0) {
+        throw new TransactionException(session,
+            "Transaction was committed more times than it was started.");
+      }
+    }
+
+    return null;
+  }
+
+  @Override
+  public RecordAbstract getRecord(final RID rid) {
+    assertOnOwningThread();
+    final var e = getRecordEntry(rid);
+    if (e != null) {
+      if (e.type == RecordOperation.DELETED) {
+        return null;
+      } else {
+        assert e.record.getSession() == session;
+        return e.record;
+      }
+    }
+    return null;
+  }
+
+  @Override
+  public void clearIndexEntries() {
+    indexEntries.clear();
+    recordIndexOperations.clear();
+  }
+
+  @Override
+  public List<String> getInvolvedIndexes() {
+    List<String> list = null;
+    for (var indexName : indexEntries.keySet()) {
+      if (list == null) {
+        list = new ArrayList<>();
+      }
+      list.add(indexName);
+    }
+    return list;
+  }
+
+  @Override
+  public Map<String, FrontendTransactionIndexChanges> getIndexOperations() {
+    return indexEntries;
+  }
+
+  @Override
+  public FrontendTransactionIndexChanges getIndexChangesInternal(final String indexName) {
+    return getIndexChanges(indexName);
+  }
+
+  @Override
+  public void addIndexEntry(
+      final Index index,
+      final String iIndexName,
+      final OPERATION iOperation,
+      final Object key,
+      final Identifiable value) {
+    // index changes are tracked on server in case of client-server deployment
+    assert session.getStorage() instanceof AbstractStorage;
+
+    try {
+      var indexEntry = indexEntries.get(iIndexName);
+      if (indexEntry == null) {
+        indexEntry = new FrontendTransactionIndexChanges(index);
+        indexEntries.put(iIndexName, indexEntry);
+      }
+
+      if (iOperation == OPERATION.CLEAR) {
+        indexEntry.setCleared();
+      } else {
+        var changes = indexEntry.getChangesPerKey(key);
+        changes.add(value, iOperation);
+
+        if (changes.key == key
+            && key instanceof ChangeableIdentity changeableIdentity
+            && changeableIdentity.canChangeIdentity()) {
+          changeableIdentity.addIdentityChangeListener(indexEntry);
+        }
+
+        if (value == null) {
+          return;
+        }
+
+        var transactionIndexOperations =
+            recordIndexOperations.get((RecordIdInternal) value.getIdentity());
+
+        if (transactionIndexOperations == null) {
+          transactionIndexOperations = new ArrayList<>();
+          recordIndexOperations.put(((RecordIdInternal) value.getIdentity()).copy(),
+              transactionIndexOperations);
+        }
+
+        transactionIndexOperations.add(
+            new FrontendTransactionRecordIndexOperation(iIndexName, key, iOperation));
+      }
+    } catch (Exception e) {
+      rollbackInternal();
+      throw e;
+    }
+  }
+
+  /**
+   * Buffer sizes index changes to be flushed at commit time.
+   */
+  @Override
+  public FrontendTransactionIndexChanges getIndexChanges(final String iIndexName) {
+    return indexEntries.get(iIndexName);
+  }
+
+  @Override
+  public int amountOfNestedTxs() {
+    return txStartCounter;
+  }
+
+  @Override
+  public void rollbackInternal() {
+    if (txStartCounter < 0) {
+      throw new TransactionException(session, "Invalid value of TX counter");
+    }
+
+    switch (status) {
+      case ROLLBACKING -> {
+        //do nothing
+      }
+      case ROLLED_BACK -> {
+        throw new IllegalStateException("Transaction is already rolled back");
+      }
+      case BEGUN, COMMITTING -> {
+        status = TXSTATUS.ROLLBACKING;
+
+        if (isWriteTransaction()) {
+          session.transactionMeters()
+              .writeRollbackTransactions()
+              .record();
+        }
+
+        //There are could be exceptions during session opening
+        // that will force to rollback of txs started during this process.
+        //Session is active only if it is opened successfully.
+        if (session.isActiveOnCurrentThread()) {
+          session.beforeRollbackOperations();
+        }
+
+        invalidateChangesInCacheDuringRollback();
+        clear();
+      }
+      case INVALID, COMPLETED -> {
+        throw new IllegalStateException("Transaction is in invalid state: " + status);
+      }
+      default -> {
+        throw new IllegalStateException("Transaction is in unknown state: " + status);
+      }
+    }
+
+    if (txStartCounter > 0) {
+      txStartCounter--;
+    }
+
+    if (txStartCounter == 0) {
+      close();
+      status = TXSTATUS.ROLLED_BACK;
+
+      assert atomicOperation == null
+          : "atomicOperation must be null after rollback close";
+      assert recordOperations.isEmpty()
+          : "recordOperations must be cleared after rollback, but had "
+              + recordOperations.size() + " entries";
+
+      //There are could be exceptions during session opening
+      // that will force to rollback of txs started during this process.
+      //Session is active only if it is opened successfully.
+      if (session.isActiveOnCurrentThread()) {
+        session.afterRollbackOperations();
+      }
+    }
+  }
+
+  private void invalidateChangesInCacheDuringRollback() {
+    for (final var v : recordOperations.values()) {
+      final var rec = v.record;
+      rec.unsetDirty();
+      rec.unload();
+    }
+
+    var localCache = session.getLocalCache();
+    localCache.unloadRecords();
+    localCache.clear();
+  }
+
+  @Override
+  public boolean exists(@Nonnull RID rid) {
+    assertOnOwningThread();
+    checkTransactionValid();
+
+    final DBRecord txRecord = getRecord(rid);
+    if (isDeletedInTx(rid)) {
+      // If the record is marked as deleted in tx, getRecord returns null per its contract
+      assert txRecord == null
+          : "getRecord must return null for a record deleted in tx. RID: " + rid;
+      return false;
+    }
+
+    if (txRecord != null) {
+      return true;
+    }
+
+    return session.executeExists(rid);
+  }
+
+  @Override
+  public @Nonnull RecordAbstract loadRecord(RID rid) {
+    assertOnOwningThread();
+    checkTransactionValid();
+
+    if (isDeletedInTx(rid)) {
+      throw new RecordNotFoundException(session, rid);
+    }
+    final var txRecord = getRecord(rid);
+    if (txRecord != null) {
+      return txRecord;
+    }
+
+    // DELEGATE TO THE STORAGE, NO TOMBSTONES SUPPORT IN TX MODE
+    var record = session.executeReadRecord((RecordIdInternal) rid, null, true);
+
+    assert record.getSession() == session
+        : "Loaded record's session must match the transaction's session. Record: " + rid;
+
+    return record;
+  }
+
+  @Override
+  public void deleteRecord(final RecordAbstract record) {
+    assertOnOwningThread();
+
+    assert record.getSession() == session
+        : "Deleted record's session must match the transaction's session. Record: "
+            + record.getIdentity();
+
+    try {
+      addRecordOperation(record, RecordOperation.DELETED);
+      //execute it here because after this operation record will be unloaded
+      preProcessRecordsAndExecuteCallCallbacks();
+    } catch (Exception e) {
+      rollbackInternal();
+      throw e;
+    }
+  }
+
+  @Override
+  public String toString() {
+    return "FrontendTransactionOptimistic [id="
+        + id
+        + ", status="
+        + status
+        + ", recEntries="
+        + recordOperations.size()
+        + ", idxEntries="
+        + indexEntries.size()
+        + ']';
+  }
+
+  @Override
+  public void setStatus(final TXSTATUS iStatus) {
+    status = iStatus;
+  }
+
+  @Override
+  @SuppressWarnings("ReferenceEquality") // Intentional identity checks: same record/txEntry instance
+  public void addRecordOperation(RecordAbstract record, byte status) {
+    assertOnOwningThread();
+    if (readOnly) {
+      throw new DatabaseException(session, "Transaction is read-only");
+    }
+
+    RecordOperation txEntry;
+    try {
+      if (record.isUnloaded()) {
+        throw new DatabaseException(session,
+            "Record "
+                + record
+                + " is not bound to session, please call "
+                + Transaction.class.getSimpleName()
+                + ".load(record) before changing it");
+      }
+      if (record.isEmbedded()) {
+        throw new DatabaseException(session,
+            "Record "
+                + record
+                + " is embedded and can not added to list of records to be saved");
+      }
+      checkTransactionValid();
+      var rid = record.getIdentity();
+
+      if (rid.getCollectionId() == RID.COLLECTION_ID_INVALID) {
+        var collectionId = session.assignAndCheckCollection(record);
+        if (rid instanceof ChangeableRecordId changeableRecordId) {
+          changeableRecordId.setCollectionAndPosition(collectionId, newRecordsPositionsGenerator--);
+        } else {
+          throw new DatabaseException(session,
+              "Provided record is not new and its identity can not be changed");
+        }
+      } else if (!rid.isValidPosition()) {
+        if (rid instanceof ChangeableRecordId changeableRecordId) {
+          changeableRecordId.setCollectionPosition(newRecordsPositionsGenerator--);
+        } else {
+          throw new DatabaseException(session,
+              "Provided record is not new and its identity can not be changed");
+        }
+      }
+
+      txEntry = getRecordEntry(rid);
+      try {
+        if (txEntry == null) {
+          if (rid.isTemporary() && status == RecordOperation.UPDATED) {
+            throw new IllegalStateException(
+                "Temporary records can not be added to the transaction");
+          }
+
+          if (record.txEntry != null) {
+            throw new TransactionException(session,
+                "Record is already in transaction with different associated transaction entry");
+          }
+
+          txEntry = new RecordOperation(record, status);
+          record.txEntry = txEntry;
+
+          recordOperations.put(record.getIdentity(), txEntry);
+          recordsInTransaction.add(record.getIdentity());
+
+          if (rid instanceof ChangeableIdentity changeableIdentity
+              && changeableIdentity.canChangeIdentity()) {
+            changeableIdentity.addIdentityChangeListener(this);
+          }
+        } else {
+          if (txEntry.record != record) {
+            final var desc = switch (record) {
+              case Entity entity -> entity.getSchemaClassName();
+              case Blob ignored -> "BLOB";
+              default -> record.getClass().getSimpleName(); // in case we extend our hierarchy
+            };
+            throw new TransactionException(session,
+                "Found record in transaction with the same RID but different instance: " +
+                    desc + " " + record.getIdentity());
+          }
+          if (record.txEntry != txEntry) {
+            throw new TransactionException(session,
+                "Record is already in transaction with different associated transaction entry");
+          }
+
+          switch (txEntry.type) {
+            case RecordOperation.UPDATED -> {
+              if (status == RecordOperation.DELETED) {
+                txEntry.type = RecordOperation.DELETED;
+              } else if (status == RecordOperation.CREATED) {
+                throw new IllegalStateException(
+                    "Invalid operation, record can not be created as it is already updated");
+              }
+            }
+            case RecordOperation.DELETED ->
+                throw new IllegalStateException(
+                    "Invalid operation, record can not be updated, created or deleted"
+                        + " as it is already deleted");
+            case RecordOperation.CREATED -> {
+              if (status == RecordOperation.DELETED) {
+                txEntry.type = RecordOperation.DELETED;
+              } else if (status == RecordOperation.CREATED) {
+                throw new IllegalStateException(
+                    "Invalid operation, record can not be created as it is already created");
+              }
+            }
+          }
+        }
+      } catch (final Exception e) {
+        throw BaseException.wrapException(
+            new DatabaseException(session,
+                "Error on execution of operation on record " + record.getIdentity()),
+            e, session);
+      }
+
+      assert txEntry.recordBeforeCallBackDirtyCounter <= record.getDirtyCounter();
+      if (txEntry.recordBeforeCallBackDirtyCounter < record.getDirtyCounter()) {
+        operationsBetweenCallbacks.put(record.getIdentity(), txEntry);
+      }
+    } catch (Exception e) {
+      rollbackInternal();
+      throw e;
+    }
+
+  }
+
+  private Map<RID, RID> doCommit(
+      @Nullable TransactionMetricsListener metricsListener,
+      @Nullable QueryMonitoringMode metricsMode,
+      @Nullable String metricsTrackingId) {
+
+    if (status == TXSTATUS.ROLLED_BACK || status == TXSTATUS.ROLLBACKING) {
+      if (status == TXSTATUS.ROLLBACKING) {
+        rollbackInternal();
+      }
+
+      throw new RollbackException(
+          "Given transaction was rolled back, and thus cannot be committed.");
+    }
+
+    var monitorWriteCommit = metricsListener != null && isWriteTransaction();
+
+    final long commitStartMillis;
+    final long commitStartNanos;
+    if (monitorWriteCommit) {
+      assert metricsMode != null && metricsTrackingId != null;
+
+      if (metricsMode == QueryMonitoringMode.LIGHTWEIGHT) {
+        var ticker = YouTrackDBEnginesManager.instance().getTicker();
+        commitStartMillis = ticker.approximateCurrentTimeMillis();
+        commitStartNanos = ticker.approximateNanoTime();
+      } else {
+        commitStartMillis = System.currentTimeMillis();
+        commitStartNanos = System.nanoTime();
+      }
+    } else {
+      commitStartMillis = 0;
+      commitStartNanos = 0;
+    }
+
+    var result = new HashMap<RID, RID>(originalChangedRecordIdMap.size());
+    try {
+      status = TXSTATUS.COMMITTING;
+      if (isWriteTransaction()) {
+        session.internalCommit(this);
+
+        if (monitorWriteCommit) {
+          notifyMetricsListener(metricsListener, metricsMode, metricsTrackingId,
+              commitStartMillis, commitStartNanos, null);
+        }
+
+        session.transactionMeters()
+            .writeTransactions()
+            .record();
+        try {
+          result.putAll(originalChangedRecordIdMap);
+          session.afterCommitOperations(result);
+        } catch (Exception e) {
+          LogManager.instance().error(this,
+              "Error during after commit callback invocation", e);
+        }
+      }
+
+    } catch (Exception e) {
+      rollbackInternal();
+      if (monitorWriteCommit) {
+        notifyMetricsListener(metricsListener, metricsMode, metricsTrackingId,
+            commitStartMillis, commitStartNanos, e);
+      }
+      throw e;
+    }
+
+    close();
+    status = TXSTATUS.COMPLETED;
+
+    assert txStartCounter == 0
+        : "txStartCounter must be 0 after successful commit, but was " + txStartCounter;
+    assert atomicOperation == null
+        : "atomicOperation must be null after close";
+
+    return result;
+  }
+
+  /// Notifies the metrics listener about a completed commit attempt. If `cause` is null,
+  /// the commit succeeded and [TransactionMetricsListener#writeTransactionCommitted] is called;
+  /// otherwise [TransactionMetricsListener#writeTransactionFailed] is called with the cause.
+  private void notifyMetricsListener(
+      TransactionMetricsListener listener, QueryMonitoringMode mode,
+      String trackingId, long commitStartMillis, long commitStartNanos,
+      @Nullable Exception cause) {
+    final long durationNanos;
+    if (mode == QueryMonitoringMode.LIGHTWEIGHT) {
+      durationNanos = YouTrackDBEnginesManager.instance().getTicker().approximateNanoTime()
+          - commitStartNanos;
+    } else {
+      durationNanos = System.nanoTime() - commitStartNanos;
+    }
+    try {
+      TransactionMetricsListener.TransactionDetails details = () -> trackingId;
+      if (cause == null) {
+        listener.writeTransactionCommitted(details, commitStartMillis, durationNanos);
+      } else {
+        listener.writeTransactionFailed(details, commitStartMillis, durationNanos, cause);
+      }
+    } catch (Exception e) {
+      LogManager.instance().error(this,
+          "Error in TransactionMetricsListener callback", e);
+    }
+  }
+
+  @Override
+  public boolean isScheduledForCallbackProcessing(RecordIdInternal rid) {
+    if (operationsBetweenCallbacks.containsKey(rid)) {
+      return true;
+    }
+
+    for (var operation : operationsForCallbackIteration) {
+      if (operation.record.getIdentity().equals(rid)) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  @Override
+  public void preProcessRecordsAndExecuteCallCallbacks() {
+    if (beforeCallBacksInProgress) {
+      throw new IllegalStateException(
+          "Callback processing is in progress, if you trigger this operation"
+              + " in beforeCallBackXXX trigger please move it to the afterCallBackXXX trigger.");
+    }
+
+    if (operationsBetweenCallbacks.isEmpty()) {
+      return;
+    }
+
+    ArrayList<RecordIdInternal> newDeletedRecords = null;
+    callbacksInProgress = true;
+    try {
+      var serializer = session.getSerializer();
+      while (!operationsBetweenCallbacks.isEmpty()) {
+        var recordOperationsToCallback = operationsBetweenCallbacks.values();
+        operationsForCallbackIteration.clear();
+
+        for (var recordOperationToCallback : recordOperationsToCallback) {
+          var dirtyCounter = recordOperationToCallback.record.getDirtyCounter();
+          assert dirtyCounter >= recordOperationToCallback.recordBeforeCallBackDirtyCounter;
+
+          if (recordOperationToCallback.recordBeforeCallBackDirtyCounter < dirtyCounter) {
+            operationsForCallbackIteration.add(recordOperationToCallback);
+          }
+        }
+
+        beforeCallBacksInProgress = true;
+        try {
+          operationsBetweenCallbacks.clear();
+
+          operationsForCallbackIteration.sort(
+              Comparator.<RecordOperation>comparingInt(recordOperation -> recordOperation.type)
+                  .reversed());
+
+          for (var recordOperation : operationsForCallbackIteration) {
+            //operations are processed and deleted from the map
+            preProcessRecordOperationAndExecuteBeforeCallbacks(recordOperation, serializer);
+
+            if (recordOperation.type == RecordOperation.DELETED
+                && recordOperation.record.getIdentity().isNew()) {
+              if (newDeletedRecords == null) {
+                newDeletedRecords = new ArrayList<>();
+              }
+
+              newDeletedRecords.add(recordOperation.getRecordId());
+            }
+          }
+        } finally {
+          beforeCallBacksInProgress = false;
+        }
+
+        var postCallBackOperations = new ArrayList<>(operationsForCallbackIteration);
+        operationsForCallbackIteration.clear();
+
+        for (var recordOperation : postCallBackOperations) {
+          callAfterCallbacks(recordOperation);
+        }
+      }
+    } finally {
+      callbacksInProgress = false;
+    }
+
+    if (newDeletedRecords != null) {
+      for (var recordId : newDeletedRecords) {
+        recordOperations.remove(recordId);
+        recordsInTransaction.remove(recordId);
+
+        if (recordId instanceof ChangeableIdentity changeableIdentity) {
+          changeableIdentity.removeIdentityChangeListener(this);
+        }
+      }
+    }
+
+    assert operationsForCallbackIteration.isEmpty();
+  }
+
+  @Override
+  public boolean isCallBackProcessingInProgress() {
+    return beforeCallBacksInProgress;
+  }
+
+  private void preProcessRecordOperationAndExecuteBeforeCallbacks(RecordOperation recordOperation,
+      RecordSerializer serializer) {
+    var record = recordOperation.record;
+    var collectionName = session.getCollectionNameById(record.getIdentity().getCollectionId());
+
+    if (recordOperation.type == RecordOperation.CREATED
+        || recordOperation.type == RecordOperation.UPDATED) {
+      String className = null;
+      EntityImpl entityImpl = null;
+      if (recordOperation.record instanceof EntityImpl entity) {
+        entityImpl = entity;
+        className = entity.getSchemaClassName();
+        if (recordOperation.recordBeforeCallBackDirtyCounter != record.getDirtyCounter()) {
+          entity.checkClass(session);
+          entity.checkAllMultiValuesAreTrackedVersions();
+
+          if (recordOperation.type == RecordOperation.CREATED) {
+            if (className != null) {
+              session.checkSecurity(Rule.ResourceGeneric.CLASS, Role.PERMISSION_CREATE,
+                  className);
+            }
+          } else {
+            // UPDATE: CHECK ACCESS ON SCHEMA CLASS NAME (IF ANY)
+            if (className != null) {
+              session.checkSecurity(Rule.ResourceGeneric.CLASS, Role.PERMISSION_UPDATE,
+                  className);
+            }
+          }
+        }
+
+        entity.recordSerializer = serializer;
+      }
+
+      recordOperation.record.processingInCallback = true;
+      try {
+        if (recordOperation.type == RecordOperation.CREATED) {
+          if (recordOperation.recordBeforeCallBackDirtyCounter == 0) {
+            if (className != null) {
+              ClassIndexManager.checkIndexesAfterCreate(entityImpl, this);
+            }
+            session.beforeCreateOperations(record, collectionName);
+          } else {
+            if (className != null) {
+              ClassIndexManager.checkIndexesAfterUpdate(entityImpl, this);
+            }
+            session.beforeUpdateOperations(record, collectionName);
+          }
+        } else {
+          if (className != null) {
+            ClassIndexManager.checkIndexesAfterUpdate(entityImpl, this);
+          }
+          session.beforeUpdateOperations(record, collectionName);
+        }
+      } finally {
+        recordOperation.record.processingInCallback = false;
+      }
+
+    } else if (recordOperation.type == RecordOperation.DELETED) {
+      String className = null;
+      EntityImpl entityImpl = null;
+
+      if (recordOperation.record instanceof EntityImpl entity) {
+        entityImpl = entity;
+        className = entity.getSchemaClassName();
+        entity.checkClass(session);
+
+        if (className != null) {
+          session.checkSecurity(Rule.ResourceGeneric.CLASS, Role.PERMISSION_DELETE,
+              className);
+        }
+      }
+
+      recordOperation.record.processingInCallback = true;
+      try {
+        if (className != null) {
+          ClassIndexManager.checkIndexesAfterDelete(entityImpl, this);
+        }
+        session.beforeDeleteOperations(record, collectionName);
+      } finally {
+        recordOperation.record.processingInCallback = false;
+      }
+
+    } else {
+      throw new IllegalStateException(
+          "Invalid record operation type " + recordOperation.type);
+    }
+
+    if (record instanceof EntityImpl entity) {
+      entity.clearTrackData();
+    }
+
+    recordOperation.recordBeforeCallBackDirtyCounter = record.getDirtyCounter();
+  }
+
+  private void callAfterCallbacks(RecordOperation recordOperation) {
+    var record = recordOperation.record;
+
+    switch (recordOperation.type) {
+      case RecordOperation.CREATED -> {
+        if (recordOperation.recordPostCallBackDirtyCounter == 0) {
+          session.afterCreateOperations(record);
+        } else {
+          session.afterUpdateOperations(record);
+        }
+      }
+      case RecordOperation.UPDATED -> session.afterUpdateOperations(record);
+      case RecordOperation.DELETED -> session.afterDeleteOperations(record);
+    }
+
+    recordOperation.recordPostCallBackDirtyCounter = record.getDirtyCounter();
+  }
+
+  @Override
+  public void close() {
+    clear();
+
+    if (atomicOperation != null) {
+      try {
+        atomicOperation.deactivate();
+        if (storageTxThreadId == Thread.currentThread().threadId()) {
+          session.getStorage().resetTsMin();
+        }
+      } finally {
+        // Ensure atomicOperation is always nulled even if deactivate() or
+        // resetTsMin() throws. Without this, a secondary rollbackInternal()
+        // call (triggered by close-listeners in
+        // DatabaseSessionEmbedded.internalClose() after the exception is
+        // caught at its rollback() call) would observe a stale non-null
+        // atomicOperation.
+        atomicOperation = null;
+        storageTxThreadId = 0;
+      }
+    }
+    session.setNoTxMode();
+    status = TXSTATUS.INVALID;
+  }
+
+  private void clear() {
+    session.closeActiveQueries();
+
+    final var dbCache = session.getLocalCache();
+    for (var txEntry : recordOperations.values()) {
+      var record = txEntry.record;
+
+      if (!record.isUnloaded()) {
+        if (record instanceof EntityImpl entity) {
+          entity.clearTransactionTrackData();
+        }
+
+        record.txEntry = null;
+        record.unsetDirty();
+        record.unload();
+      }
+    }
+
+    dbCache.unloadRecords();
+    dbCache.clear();
+
+    clearUnfinishedChanges();
+
+    recordSerializationContext.clear();
+  }
+
+  private void clearUnfinishedChanges() {
+    recordOperations.clear();
+    recordsInTransaction.clear();
+    indexEntries.clear();
+    recordIndexOperations.clear();
+
+    newRecordsPositionsGenerator = -2;
+
+    userData.clear();
+  }
+
+  @Override
+  public boolean assertIdentityChangedAfterCommit(final RecordIdInternal oldRid,
+      final RecordIdInternal newRid) {
+    if (oldRid.equals(newRid))
+    // NO CHANGE, IGNORE IT
+    {
+      return true;
+    }
+    final var database = session;
+    final var indexManager = database.getSharedContext().getIndexManager();
+    for (var entry : indexEntries.entrySet()) {
+      final var index = indexManager.getIndex(entry.getKey());
+      if (index == null) {
+        throw new TransactionException(session,
+            "Cannot find index '" + entry.getValue() + "' while committing transaction");
+      }
+
+      final var fieldRidDependencies = getIndexFieldRidDependencies(index);
+      if (!isIndexMayDependOnRids(fieldRidDependencies)) {
+        continue;
+      }
+
+      final var indexChanges = entry.getValue();
+      for (final var keyChanges : indexChanges.changesPerKey.values()) {
+        assert !isIndexKeyMayDependOnRid(keyChanges.key, oldRid, fieldRidDependencies)
+            : "Index key " + keyChanges.key
+                + " may depend on RID " + oldRid
+                + ", but it was not updated during record update. Index: "
+                + index.getName()
+                + ", key: "
+                + keyChanges.key;
+      }
+    }
+
+    // Update the identity.
+    final var rec = getRecordEntry(oldRid);
+    assert rec != null : "Record ID " + oldRid
+        + " was not found in the transaction, but it was expected to be found. Record : "
+        + oldRid;
+    if (!rec.record.getIdentity().equals(newRid)) {
+      final var recordId = rec.record.getIdentity();
+
+      assert false : "Record ID " + recordId
+          + " was not updated during record update, but it was expected to be updated. Record : "
+          + rec.record;
+    }
+
+    // Update the indexes.
+    final var transactionIndexOperations = recordIndexOperations.get(rec.getRecordId());
+    if (transactionIndexOperations != null) {
+      for (final var indexOperation : transactionIndexOperations) {
+        var indexEntryChanges = indexEntries.get(indexOperation.index);
+        if (indexEntryChanges == null) {
+          continue;
+        }
+        final FrontendTransactionIndexChangesPerKey keyChanges;
+        if (indexOperation.key == null) {
+          keyChanges = indexEntryChanges.nullKeyChanges;
+        } else {
+          keyChanges = indexEntryChanges.changesPerKey.get(indexOperation.key);
+        }
+        if (keyChanges != null) {
+          assertChangesHaveOldIdentity(indexOperation.index, oldRid, keyChanges);
+        }
+      }
+    }
+
+    return true;
+  }
+
+  private static void assertChangesHaveOldIdentity(String indexName,
+      RID oldRid, FrontendTransactionIndexChangesPerKey changesPerKey) {
+    if (changesPerKey == null) {
+      return;
+    }
+
+    for (final var indexEntry : changesPerKey.getEntriesAsList()) {
+      assert !indexEntry.getValue().getIdentity().equals(oldRid)
+          : "Index entry " + indexEntry.getValue()
+              + " may depend on RID " + oldRid
+              + ", but it was not updated during record update. Index: "
+              + indexName
+              + ", key: "
+              + changesPerKey.key;
+    }
+  }
+
+  @Override
+  public void setCustomData(String iName, Object iValue) {
+    userData.put(iName, iValue);
+  }
+
+  @Override
+  public Object getCustomData(String iName) {
+    return userData.get(iName);
+  }
+
+  @Nullable private static Dependency[] getIndexFieldRidDependencies(Index index) {
+    final var definition = index.getDefinition();
+
+    if (definition == null) { // type for untyped index is still not resolved
+      return null;
+    }
+
+    final var types = definition.getTypes();
+    final var dependencies = new Dependency[types.length];
+
+    for (var i = 0; i < types.length; ++i) {
+      dependencies[i] = getTypeRidDependency(types[i]);
+    }
+
+    return dependencies;
+  }
+
+  private static boolean isIndexMayDependOnRids(Dependency[] fieldDependencies) {
+    if (fieldDependencies == null) {
+      return true;
+    }
+
+    for (var dependency : fieldDependencies) {
+      switch (dependency) {
+        case Unknown, Yes -> {
+          return true;
+        }
+        case No -> {
+          // do nothing
+        }
+      }
+    }
+
+    return false;
+  }
+
+  private static boolean isIndexKeyMayDependOnRid(
+      Object key, RID rid, Dependency[] keyDependencies) {
+    if (key instanceof CompositeKey compositeKey) {
+      final var subKeys = compositeKey.getKeys();
+      for (var i = 0; i < subKeys.size(); ++i) {
+        if (isIndexKeyMayDependOnRid(
+            subKeys.get(i), rid, keyDependencies == null ? null : keyDependencies[i])) {
+          return true;
+        }
+      }
+      return false;
+    }
+
+    return isIndexKeyMayDependOnRid(key, rid, keyDependencies == null ? null : keyDependencies[0]);
+  }
+
+  private static boolean isIndexKeyMayDependOnRid(Object key, RID rid, Dependency dependency) {
+    if (dependency == Dependency.No) {
+      return false;
+    }
+
+    if (key instanceof Identifiable) {
+      return key.equals(rid);
+    }
+
+    return dependency == Dependency.Unknown || dependency == null;
+  }
+
+  private static Dependency getTypeRidDependency(PropertyTypeInternal type) {
+    // fallback to the safest variant, just in case
+    return switch (type) {
+      case EMBEDDED, LINK -> Dependency.Yes;
+      case LINKLIST, LINKSET, LINKMAP, LINKBAG, EMBEDDEDLIST, EMBEDDEDSET, EMBEDDEDMAP ->
+          // under normal conditions, collection field type is already resolved to its
+          // component type
+          throw new IllegalStateException("Collection field type is not allowed here");
+      default -> // all other primitive types which doesn't depend on rids
+          Dependency.No;
+    };
+  }
+
+  @Override
+  public void onBeforeIdentityChange(Object source) {
+    var rid = (RecordIdInternal) source;
+
+    var recordOperation = recordOperations.remove(rid);
+
+    if (recordOperation != null) {
+      recordOperationsIdentityMap.put(rid, recordOperation);
+      var removed = originalChangedRecordIdMap.put(rid.copy(), rid);
+
+      if (removed != null) {
+        throw new IllegalStateException("RecordId " + rid
+            + " was already changed in the transaction. Old RID: " + removed);
+      }
+
+      recordsInTransaction.remove(rid);
+    }
+
+    recordOperation = operationsBetweenCallbacks.remove(rid);
+    if (recordOperation != null) {
+      operationsBetweenCallbacksIdentityMap.put(rid, recordOperation);
+    }
+
+    var recordIndexOperation = recordIndexOperations.remove(rid);
+    if (recordIndexOperation != null) {
+      recordIndexOperationsIdentityMap.put(rid, recordIndexOperation);
+    }
+  }
+
+  @Override
+  public void onAfterIdentityChange(Object source) {
+    var rid = (RecordIdInternal) source;
+
+    var recordOperation = recordOperationsIdentityMap.remove(rid);
+    if (recordOperation != null) {
+      recordOperations.put(rid, recordOperation);
+      recordsInTransaction.add(rid);
+    }
+
+    recordOperation = operationsBetweenCallbacksIdentityMap.remove(rid);
+    if (recordOperation != null) {
+      operationsBetweenCallbacks.put(rid, recordOperation);
+    }
+
+    var recordIndexOperation = recordIndexOperationsIdentityMap.remove(rid);
+    if (recordIndexOperation != null) {
+      recordIndexOperations.put(rid, recordIndexOperation);
+    }
+  }
+
+  @Override
+  @Nullable public RecordIdInternal getNextRidInCollection(
+      @Nonnull RecordIdInternal rid,
+      long upperBoundExclusive) {
+    final var collectionId = rid.getCollectionId();
+    while (true) {
+      var result = recordsInTransaction.higher(rid);
+
+      if (result == null ||
+          result.getCollectionId() != collectionId ||
+          result.getCollectionPosition() >= upperBoundExclusive) {
+        return null;
+      }
+
+      final var record = getRecordEntry(result);
+
+      if (record != null && record.type == RecordOperation.DELETED) {
+        rid = result;
+        continue;
+      }
+      return result;
+    }
+  }
+
+  @Override
+  @Nullable public RecordIdInternal getPreviousRidInCollection(
+      @Nonnull RecordIdInternal rid,
+      long lowerBoundInclusive) {
+    final var collectionId = rid.getCollectionId();
+
+    while (true) {
+      var result = recordsInTransaction.lower(rid);
+
+      if (result == null ||
+          result.getCollectionId() != collectionId ||
+          result.getCollectionPosition() < lowerBoundInclusive) {
+        return null;
+      }
+
+      final var record = getRecordEntry(result);
+      if (record != null && record.type == RecordOperation.DELETED) {
+        rid = result;
+        continue;
+      }
+
+      return result;
+    }
+  }
+
+  @Override
+  public boolean isDeletedInTx(@Nonnull RID rid) {
+    var txEntry = getRecordEntry(rid);
+    return txEntry != null && txEntry.type == RecordOperation.DELETED;
+  }
+
+  public AtomicOperation getAtomicOperation() {
+    return atomicOperation;
+  }
+
+  private enum Dependency {
+    Unknown, Yes, No
+  }
+
+  protected void checkTransactionValid() {
+    if (status == TXSTATUS.INVALID) {
+      throw new TransactionException(session,
+          "Invalid state of the transaction. The transaction must be begun.");
+    }
+  }
+
+  @Override
+  public long getId() {
+    return id;
+  }
+
+  @Override
+  public void clearRecordEntries() {
+  }
+
+  public void restore() {
+  }
+
+  @Override
+  public int getEntryCount() {
+    return recordOperations.size();
+  }
+
+  @Override
+  public Collection<RecordOperation> getCurrentRecordEntries() {
+    return recordOperations.values();
+  }
+
+  @Override
+  public Collection<RecordOperation> getRecordOperationsInternal() {
+    return recordOperations.values();
+  }
+
+  @Override
+  public RecordOperation getRecordEntry(RID rid) {
+    assert rid instanceof RecordIdInternal;
+    var operation = recordOperations.get(rid);
+
+    if (operation == null) {
+      var changedRid = originalChangedRecordIdMap.get(rid);
+      if (changedRid != null) {
+        operation = recordOperations.get(changedRid);
+      }
+    }
+
+    return operation;
+  }
+
+  public int getTxStartCounter() {
+    return txStartCounter;
+  }
+
+  @Override
+  public boolean isActive() {
+    return status != TXSTATUS.INVALID
+        && status != TXSTATUS.COMPLETED
+        && status != TXSTATUS.ROLLED_BACK;
+  }
+
+  @Override
+  public TXSTATUS getStatus() {
+    return status;
+  }
+
+  @Override
+  @Nonnull
+  public final DatabaseSessionEmbedded getDatabaseSession() {
+    return session;
+  }
+
+  @Override
+  public void setSession(@Nonnull DatabaseSessionEmbedded session) {
+    this.session = session;
+  }
+
+  @Nonnull
+  @Override
+  public Entity loadEntity(RID id) throws DatabaseException, RecordNotFoundException {
+    checkIfActive();
+    return session.loadEntity(id);
+  }
+
+  @Nonnull
+  @Override
+  public Entity loadEntity(Identifiable identifiable)
+      throws DatabaseException, RecordNotFoundException {
+    checkIfActive();
+
+    if (identifiable instanceof Entity entity) {
+      if (entity.isEmbedded()) {
+        return entity;
+      }
+      if (entity.isNotBound(session)) {
+        return loadEntity(entity.getIdentity());
+      }
+
+      return entity;
+    } else if (identifiable instanceof DBRecord) {
+      throw new DatabaseException(session, "Record " + identifiable + "is not an entity.");
+    }
+
+    return session.loadEntity(identifiable.getIdentity());
+  }
+
+  @Nullable @Override
+  public Entity loadEntityOrNull(Identifiable identifiable) throws DatabaseException {
+    checkIfActive();
+    if (identifiable instanceof Entity entity) {
+      if (entity.isNotBound(session)) {
+        return loadEntityOrNull(entity.getIdentity());
+      }
+      return entity;
+    } else if (identifiable instanceof DBRecord) {
+      throw new DatabaseException(session, "Record " + identifiable + "is not an entity.");
+    }
+
+    try {
+      return session.loadEntity(identifiable.getIdentity());
+    } catch (RecordNotFoundException e) {
+      return null;
+    }
+  }
+
+  @Nullable @Override
+  public Entity loadEntityOrNull(RID id) throws DatabaseException {
+    checkIfActive();
+    try {
+      return session.loadEntity(id);
+    } catch (RecordNotFoundException e) {
+      return null;
+    }
+  }
+
+  @Nonnull
+  @Override
+  public Vertex loadVertex(RID id) throws DatabaseException, RecordNotFoundException {
+    checkIfActive();
+    return session.loadVertex(id);
+  }
+
+  @Nullable @Override
+  public Vertex loadVertexOrNull(RID id) throws RecordNotFoundException {
+    checkIfActive();
+    try {
+      return session.loadVertex(id);
+    } catch (RecordNotFoundException e) {
+      return null;
+    }
+  }
+
+  @Nonnull
+  @Override
+  public Vertex loadVertex(Identifiable identifiable)
+      throws DatabaseException, RecordNotFoundException {
+    checkIfActive();
+    if (identifiable instanceof Vertex vertex) {
+      if (vertex.isNotBound(session)) {
+        return loadVertex(vertex.getIdentity());
+      }
+
+      return vertex;
+    } else if (identifiable instanceof DBRecord) {
+      throw new DatabaseException(session, "Record " + identifiable + "is not a vertex.");
+    }
+
+    return session.loadVertex(identifiable.getIdentity());
+  }
+
+  @Nullable @Override
+  public Vertex loadVertexOrNull(Identifiable identifiable) throws RecordNotFoundException {
+    checkIfActive();
+    if (identifiable instanceof Vertex vertex) {
+      if (vertex.isNotBound(session)) {
+        return loadVertexOrNull(vertex.getIdentity());
+      }
+      return vertex;
+    } else if (identifiable instanceof DBRecord) {
+      throw new DatabaseException(session, "Record " + identifiable + "is not a vertex.");
+    }
+
+    try {
+      return session.loadVertex(identifiable.getIdentity());
+    } catch (RecordNotFoundException e) {
+      return null;
+    }
+
+  }
+
+  @Nonnull
+  @Override
+  public Edge loadEdge(@Nonnull RID id) throws DatabaseException, RecordNotFoundException {
+    checkIfActive();
+    return session.loadEdge(id);
+  }
+
+  @Nullable @Override
+  public Edge loadEdgeOrNull(@Nonnull RID id) throws DatabaseException {
+    checkIfActive();
+    try {
+      return session.loadEdge(id);
+    } catch (RecordNotFoundException e) {
+      return null;
+    }
+  }
+
+  @Nonnull
+  @Override
+  public Edge loadEdge(@Nonnull Identifiable id)
+      throws DatabaseException, RecordNotFoundException {
+    checkIfActive();
+    if (id instanceof Edge edge) {
+      if (edge.isNotBound(session)) {
+        return loadEdge(edge.getIdentity());
+      }
+
+      return edge;
+    } else if (id instanceof DBRecord) {
+      throw new DatabaseException(session, "Record " + id + "is not an edge.");
+    }
+
+    return session.loadEdge(id.getIdentity());
+  }
+
+  @Override
+  public Edge loadEdgeOrNull(@Nonnull Identifiable id) throws DatabaseException {
+    checkIfActive();
+    if (id instanceof Edge edge) {
+      if (edge.isNotBound(session)) {
+        return loadEdgeOrNull(edge.getIdentity());
+      }
+      return edge;
+    } else if (id instanceof DBRecord) {
+      throw new DatabaseException(session, "Record " + id + "is not an edge.");
+    }
+
+    try {
+      return session.loadEdge(id.getIdentity());
+    } catch (RecordNotFoundException e) {
+      return null;
+    }
+  }
+
+  @Nonnull
+  @Override
+  public Blob loadBlob(@Nonnull RID id) throws DatabaseException, RecordNotFoundException {
+    checkIfActive();
+    return session.loadBlob(id);
+  }
+
+  @Nullable @Override
+  public Blob loadBlobOrNull(@Nonnull RID id) throws DatabaseException, RecordNotFoundException {
+    checkIfActive();
+    try {
+      return session.loadBlob(id);
+    } catch (RecordNotFoundException e) {
+      return null;
+    }
+  }
+
+  @Nonnull
+  @Override
+  public Blob loadBlob(@Nonnull Identifiable id) throws DatabaseException, RecordNotFoundException {
+    checkIfActive();
+    if (id instanceof Blob blob) {
+      if (blob.isNotBound(session)) {
+        return loadBlob(blob.getIdentity());
+      }
+      return blob;
+    } else if (id instanceof DBRecord) {
+      throw new DatabaseException(session, "Record " + id + "is not a blob.");
+    }
+
+    return session.loadBlob(id.getIdentity());
+  }
+
+  @Override
+  public Blob loadBlobOrNull(@Nonnull Identifiable id) throws DatabaseException {
+    checkIfActive();
+    if (id instanceof Blob blob) {
+      if (blob.isNotBound(session)) {
+        return loadBlobOrNull(blob.getIdentity());
+      }
+
+      return blob;
+    } else if (id instanceof DBRecord) {
+      throw new DatabaseException(session, "Record " + id + "is not a blob.");
+    }
+
+    try {
+      return session.loadBlob(id.getIdentity());
+    } catch (RecordNotFoundException e) {
+      return null;
+    }
+
+  }
+
+  @Override
+  public Blob newBlob(@Nonnull byte[] bytes) {
+    checkIfActive();
+    return session.newBlob(bytes);
+  }
+
+  @Override
+  public Blob newBlob() {
+    checkIfActive();
+    return session.newBlob();
+  }
+
+  @Override
+  public Entity newEntity(String className) {
+    checkIfActive();
+    return session.newEntity(className);
+  }
+
+  @Override
+  public Entity newEntity(SchemaClass cls) {
+    checkIfActive();
+    return session.newEntity(cls);
+  }
+
+  @Override
+  public Entity newEntity() {
+    checkIfActive();
+    return session.newEntity();
+  }
+
+  @Override
+  public EmbeddedEntity newEmbeddedEntity(SchemaClass schemaClass) {
+    checkIfActive();
+    return session.newEmbeddedEntity(schemaClass);
+  }
+
+  @Override
+  public EmbeddedEntity newEmbeddedEntity(String schemaClass) {
+    checkIfActive();
+    return session.newEmbeddedEntity(schemaClass);
+  }
+
+  @Override
+  public EmbeddedEntity newEmbeddedEntity() {
+    checkIfActive();
+    return session.newEmbeddedEntity();
+  }
+
+  @SuppressWarnings("TypeParameterUnusedInFormals")
+  @Override
+  public <T extends DBRecord> T createOrLoadRecordFromJson(String json) {
+    checkIfActive();
+    return session.createOrLoadRecordFromJson(json);
+  }
+
+  @Override
+  public Entity createOrLoadEntityFromJson(String json) {
+    checkIfActive();
+    return session.createOrLoadEntityFromJson(json);
+  }
+
+  @Override
+  public Edge newEdge(Vertex from, Vertex to, SchemaClass type) {
+    checkIfActive();
+    return session.newEdge(from, to, type);
+  }
+
+  @Override
+  public Edge newEdge(Vertex from, Vertex to, String type) {
+    checkIfActive();
+    return session.newEdge(from, to, type);
+  }
+
+  @Override
+  public Vertex newVertex(SchemaClass type) {
+    checkIfActive();
+    return session.newVertex(type);
+  }
+
+  @Override
+  public Vertex newVertex(String type) {
+    checkIfActive();
+    return session.newVertex(type);
+  }
+
+  @Override
+  public Edge newEdge(Vertex from, Vertex to) {
+    checkIfActive();
+    return session.newEdge(from, to);
+  }
+
+  @Nonnull
+  @SuppressWarnings("TypeParameterUnusedInFormals")
+  @Override
+  public <RET extends DBRecord> RET load(RID recordId) {
+    checkIfActive();
+    return session.load(recordId);
+  }
+
+  @Nullable @SuppressWarnings("TypeParameterUnusedInFormals")
+  @Override
+  public <RET extends DBRecord> RET loadOrNull(RID recordId) {
+    checkIfActive();
+    return session.loadOrNull(recordId);
+  }
+
+  @Nonnull
+  @SuppressWarnings("TypeParameterUnusedInFormals")
+  @Override
+  public <RET extends DBRecord> RET load(Identifiable identifiable) {
+    checkIfActive();
+
+    if (identifiable instanceof DBRecord record) {
+      if (record instanceof Entity entity && entity.isEmbedded()) {
+        //noinspection unchecked
+        return (RET) record;
+      }
+      if (record.isNotBound(session)) {
+        return load(record.getIdentity());
+      }
+      //noinspection unchecked
+      return (RET) record;
+    }
+
+    return session.load(identifiable.getIdentity());
+  }
+
+  @Nullable @SuppressWarnings("TypeParameterUnusedInFormals")
+  @Override
+  public <RET extends DBRecord> RET loadOrNull(Identifiable identifiable) {
+    checkIfActive();
+    if (identifiable instanceof DBRecord record) {
+      //noinspection unchecked
+      return (RET) record;
+    }
+
+    return session.loadOrNull(identifiable.getIdentity());
+  }
+
+  @Override
+  public void delete(@Nonnull DBRecord record) {
+    checkIfActive();
+    session.delete(record);
+  }
+
+  @Override
+  public Map<RID, RID> commit() throws TransactionException {
+    checkIfActive();
+    return session.commit();
+  }
+
+  @Override
+  public void rollback() throws TransactionException {
+    checkIfActive();
+    session.rollback();
+  }
+
+  @Override
+  public ResultSet query(String query, Object... args)
+      throws CommandSQLParsingException, CommandExecutionException {
+    checkIfActive();
+    return session.query(query, args);
+  }
+
+  @Override
+  public ResultSet query(String query, @SuppressWarnings("rawtypes") Map args)
+      throws CommandSQLParsingException, CommandExecutionException {
+    checkIfActive();
+    return session.query(query, args);
+  }
+
+  @Override
+  public ResultSet execute(String query, Object... args)
+      throws CommandSQLParsingException, CommandExecutionException {
+    checkIfActive();
+    return session.execute(query, args);
+  }
+
+  @Override
+  public ResultSet execute(String query, @SuppressWarnings("rawtypes") Map args)
+      throws CommandSQLParsingException, CommandExecutionException {
+    checkIfActive();
+    return session.execute(query, args);
+  }
+
+  @Override
+  public void command(String query, Object... args)
+      throws CommandSQLParsingException, CommandExecutionException {
+    checkIfActive();
+    session.command(query, args);
+  }
+
+  @Override
+  public void command(String query, @SuppressWarnings("rawtypes") Map args)
+      throws CommandSQLParsingException, CommandExecutionException {
+    checkIfActive();
+    session.command(query, args);
+  }
+
+  @Override
+  public ResultSet computeScript(String language, String script, Object... args)
+      throws CommandExecutionException, CommandScriptException {
+    return session.computeScript(language, script, args);
+  }
+
+  @Override
+  public ResultSet computeScript(String language, String script, Map<String, ?> args)
+      throws CommandExecutionException, CommandScriptException {
+    return session.computeScript(language, script, args);
+  }
+
+  private void checkIfActive() {
+    if (!isActive()) {
+      throw new TransactionException(session,
+          "Transaction is not active and can not be used.");
+    }
+  }
+
+  @Override
+  public @Nonnull Stream<com.jetbrains.youtrackdb.internal.core.tx.RecordOperation>
+      getRecordOperations() {
+    checkIfActive();
+    return getRecordOperationsInternal().stream()
+        .map(recordOperation -> switch (recordOperation.type) {
+          case RecordOperation.CREATED ->
+              new com.jetbrains.youtrackdb.internal.core.tx.RecordOperation(recordOperation.record,
+                  RecordOperationType.CREATED);
+          case RecordOperation.UPDATED ->
+              new com.jetbrains.youtrackdb.internal.core.tx.RecordOperation(recordOperation.record,
+                  RecordOperationType.UPDATED);
+          case RecordOperation.DELETED ->
+              new com.jetbrains.youtrackdb.internal.core.tx.RecordOperation(recordOperation.record,
+                  RecordOperationType.DELETED);
+          default -> throw new IllegalStateException("Unexpected value: " + recordOperation.type);
+        });
+  }
+
+  @Override
+  public int getRecordOperationsCount() {
+    checkIfActive();
+    return getRecordOperationsInternal().size();
+  }
+
+  @Override
+  public int activeTxCount() {
+    checkIfActive();
+    return amountOfNestedTxs();
+  }
+
+  @Override
+  public @Nonnull RecordSerializationContext getRecordSerializationContext() {
+    return recordSerializationContext;
+  }
+
+  private boolean isWriteTransaction() {
+    return !recordOperations.isEmpty() || !indexEntries.isEmpty();
+  }
+
+  public static long generateTxId() {
+    return ThreadLocalRandom.current().nextLong(Long.MAX_VALUE);
+  }
+
+}

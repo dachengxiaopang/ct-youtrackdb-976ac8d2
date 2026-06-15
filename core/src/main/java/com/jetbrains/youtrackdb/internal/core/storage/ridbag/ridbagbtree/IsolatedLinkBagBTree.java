@@ -1,0 +1,101 @@
+package com.jetbrains.youtrackdb.internal.core.storage.ridbag.ridbagbtree;
+
+import com.jetbrains.youtrackdb.internal.common.serialization.types.BinarySerializer;
+import com.jetbrains.youtrackdb.internal.core.storage.cache.ReadCache;
+import com.jetbrains.youtrackdb.internal.core.storage.impl.local.paginated.atomicoperations.AtomicOperation;
+import com.jetbrains.youtrackdb.internal.core.storage.index.sbtree.TreeInternal;
+import com.jetbrains.youtrackdb.internal.core.storage.ridbag.LinkBagPointer;
+import java.io.IOException;
+import java.util.Spliterator;
+import javax.annotation.Nonnull;
+import javax.annotation.Nullable;
+
+public interface IsolatedLinkBagBTree<K, V> extends TreeInternal<K, V> {
+
+  /**
+   * Gets id of file where this bonsai tree is stored.
+   *
+   * @return id of file in {@link ReadCache}
+   */
+  long getFileId();
+
+  /**
+   * Returns the pointer to the root bucket in this tree.
+   *
+   * @return the pointer to the root bucket in tree.
+   */
+  LinkBagBucketPointer getRootBucketPointer();
+
+  /**
+   * Returns the pointer to the collection associated with this B-tree.
+   *
+   * @return pointer to a collection.
+   */
+  LinkBagPointer getCollectionPointer();
+
+  /**
+   * Search for entry with specific key and return its value.
+   *
+   * @param key             the key to search for
+   * @param atomicOperation the current atomic operation context
+   * @return value associated with given key, NULL if no value is associated.
+   */
+  @Nullable
+  V get(K key, AtomicOperation atomicOperation);
+
+  boolean put(AtomicOperation atomicOperation, K key, V value) throws IOException;
+
+  /**
+   * Deletes all entries from tree.
+   *
+   * @param atomicOperation the current atomic operation context
+   */
+  void clear(AtomicOperation atomicOperation) throws IOException;
+
+  /**
+   * Deletes whole tree. After this operation tree is no longer usable.
+   *
+   * @param atomicOperation the current atomic operation context
+   */
+  void delete(AtomicOperation atomicOperation);
+
+  @Override
+  boolean isEmpty(AtomicOperation atomicOperation);
+
+  @Override
+  V remove(AtomicOperation atomicOperation, K key) throws IOException;
+
+  @Override
+  void loadEntriesMajor(
+      K key, boolean inclusive, boolean ascSortOrder, RangeResultListener<K, V> listener,
+      AtomicOperation atomicOperation);
+
+  @Nonnull
+  Spliterator<BTreeReadEntry<K>> spliteratorEntriesBetween(
+      @Nonnull K keyFrom, boolean fromInclusive, @Nonnull K keyTo, boolean toInclusive,
+      boolean ascSortOrder, AtomicOperation atomicOperation);
+
+  @Nullable
+  @Override
+  K firstKey(AtomicOperation atomicOperation);
+
+  @Nullable
+  K lastKey(AtomicOperation atomicOperation);
+
+  /**
+   * Hardcoded method for Bag to avoid creation of extra layer.
+   *
+   * <p>Don't make any changes to tree.
+   *
+   * @return real bag size
+   */
+  int getRealBagSize(AtomicOperation atomicOperation);
+
+  BinarySerializer<K> getKeySerializer();
+
+  BinarySerializer<V> getValueSerializer();
+
+  record BTreeReadEntry<K>(K primaryRid, int counter, int secondaryCollectionId,
+                           long secondaryPosition) {
+  }
+}
